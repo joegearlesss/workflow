@@ -1,5 +1,226 @@
 # Developer Guide - Workflow Library
 
+## Library Structure
+
+```
+├── package.json                 # Root workspace configuration
+├── packages/                    # Core library packages
+│   ├── core/                    # Main workflow library
+│   │   ├── src/
+│   │   │   ├── workflow.ts      # Main Workflow class with fluent API
+│   │   │   ├── workflow.test.ts # Unit tests for workflow
+│   │   │   ├── context.ts       # WorkflowContext implementation
+│   │   │   ├── context.test.ts  # Unit tests for context
+│   │   │   ├── engine.ts        # Execution engine
+│   │   │   ├── engine.test.ts   # Unit tests for engine
+│   │   │   ├── state.ts         # State management
+│   │   │   ├── state.test.ts    # Unit tests for state
+│   │   │   └── index.ts         # Public exports
+│   │   ├── package.json         # Publishable package
+│   │   └── tsconfig.json
+│   ├── database/                # Per-workflow SQLite persistence
+│   │   ├── src/
+│   │   │   ├── schema.ts        # Database schema definitions
+│   │   │   ├── schema.test.ts   # Unit tests for schema
+│   │   │   ├── workflow-db.ts   # Per-workflow database management
+│   │   │   ├── workflow-db.test.ts # Unit tests for workflow DB
+│   │   │   ├── registry.ts      # Workflow registry and discovery
+│   │   │   ├── registry.test.ts # Unit tests for registry
+│   │   │   ├── connection.ts    # Connection management
+│   │   │   └── connection.test.ts # Unit tests for connection
+│   │   └── package.json
+│   ├── types/                   # TypeScript definitions
+│   │   ├── src/
+│   │   │   ├── workflow.ts      # Workflow types
+│   │   │   ├── context.ts       # Context types
+│   │   │   └── common.ts        # Common types
+│   │   └── package.json
+│   └── utils/                   # Utility functions
+│       ├── src/
+│       │   ├── logger.ts        # Logging utilities
+│       │   ├── logger.test.ts   # Unit tests for logger
+│       │   ├── validation.ts    # Validation helpers
+│       │   └── validation.test.ts # Unit tests for validation
+│       └── package.json
+├── apps/                        # Development tools
+│   └── cli/                     # CLI tool for debugging workflows
+│       ├── src/
+│       │   ├── index.ts         # CLI entry point
+│       │   ├── commands/        # CLI commands
+│       │   │   ├── list.ts      # List workflows command
+│       │   │   ├── create.ts    # Create workflow command
+│       │   │   ├── start.ts     # Start execution command
+│       │   │   ├── status.ts    # Check execution status
+│       │   │   ├── logs.ts      # View execution logs
+│       │   │   ├── inspect.ts   # Inspect workflow state
+│       │   │   └── cleanup.ts   # Cleanup old executions
+│       │   └── utils/           # CLI utilities
+│       │       ├── output.ts    # Output formatting
+│       │       ├── database.ts  # Database inspection tools
+│       │       └── config.ts    # CLI configuration
+│       └── tests/
+│           └── commands.test.ts # CLI command tests
+└── tests/                       # End-to-end test suites
+    └── e2e/                     # End-to-end tests
+        ├── workflow-execution.test.ts
+        ├── panic-recovery.test.ts
+        └── integration.test.ts
+```
+
+## Runtime Directory Structure
+
+When workflows are executed, the library creates a runtime directory structure in the user's home directory for persistence and state management:
+
+```
+~/.workflow/                    # Runtime workflow data directory
+├── registry.db                 # Central workflow registry database
+├── workflows/                  # Workflow definitions and metadata
+│   ├── data-processing/         # Per-workflow directory
+│   │   ├── definition.json      # Workflow definition metadata
+│   │   └── config.json          # Workflow-specific configuration
+│   ├── api-workflow/
+│   │   ├── definition.json
+│   │   └── config.json
+│   └── simple-log/
+│       ├── definition.json
+│       └── config.json
+├── db/                         # Database storage
+│   ├── data-processing.db       # Per-workflow database
+│   ├── api-workflow.db          # Per-workflow database
+│   └── simple-log.db            # Per-workflow database
+└── logs/                       # Execution logs
+    ├── data-processing/         # Per-workflow log directory
+    │   ├── 2024-01-15.log      # Daily log files
+    │   ├── 2024-01-16.log
+    │   └── executions/          # Per-execution detailed logs
+    │       ├── exec-123.log
+    │       └── exec-456.log
+    ├── api-workflow/
+    │   ├── 2024-01-15.log
+    │   └── executions/
+    │       └── exec-789.log
+    └── simple-log/
+        ├── 2024-01-15.log
+        └── executions/
+            └── exec-abc.log
+```
+
+### Database Structure
+
+**Central Registry (`~/.workflow/registry.db`)**
+```sql
+CREATE TABLE workflow_registry (
+    name TEXT PRIMARY KEY,
+    db_path TEXT NOT NULL,              -- Path: db/{workflow-name}.db
+    workflow_dir TEXT NOT NULL,         -- Path: workflows/{workflow-name}/
+    log_dir TEXT NOT NULL,              -- Path: logs/{workflow-name}/
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_execution_at DATETIME,
+    execution_count INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'active'
+);
+```
+
+**Per-Workflow Database (`~/.workflow/db/{workflow-name}.db`)**
+```sql
+CREATE TABLE executions (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME,
+    restart_attempt INTEGER DEFAULT 1,
+    error_message TEXT,
+    input_data TEXT
+);
+
+CREATE TABLE steps (
+    execution_id TEXT NOT NULL,
+    step_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME,
+    result_data TEXT,
+    error_message TEXT,
+    attempt INTEGER DEFAULT 1,
+    PRIMARY KEY (execution_id, step_id),
+    FOREIGN KEY (execution_id) REFERENCES executions (id) ON DELETE CASCADE
+);
+
+CREATE TABLE circuit_breaker_state (
+    step_id TEXT PRIMARY KEY,
+    failures INTEGER DEFAULT 0,
+    is_open BOOLEAN DEFAULT false,
+    last_failure_time INTEGER,
+    reset_time INTEGER
+);
+
+CREATE TABLE step_errors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    execution_id TEXT NOT NULL,
+    step_id TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    error_stack TEXT,
+    attempt INTEGER NOT NULL,
+    timestamp INTEGER NOT NULL,
+    INDEX idx_execution_step (execution_id, step_id)
+);
+```
+
+### Directory Management
+
+- **Automatic Creation**: The `~/.workflow/` directory and its subdirectories are created automatically on first workflow execution
+- **Organized Structure**: 
+  - `workflows/`: Contains workflow definitions and configuration files
+  - `db/`: Isolated database storage for each workflow
+  - `logs/`: Structured logging with daily logs and per-execution detailed logs
+- **Per-Workflow Isolation**: Each workflow gets its own subdirectory in `workflows/`, its own database in `db/`, and its own log directory in `logs/`
+- **Registry Management**: The central registry tracks all workflows and their locations across the directory structure
+- **Cleanup**: Old execution data can be cleaned up using the CLI `cleanup` command
+- **Portability**: The entire `~/.workflow/` directory can be backed up or moved between systems
+
+### Workflow Definition Files
+
+Each workflow directory in `~/.workflow/workflows/{workflow-name}/` contains:
+
+**`definition.json`** - Workflow metadata and configuration:
+```json
+{
+  "name": "data-processing",
+  "version": "1.0.0",
+  "description": "Process data from external APIs",
+  "created_at": "2024-01-15T10:30:00Z",
+  "last_modified": "2024-01-16T14:22:00Z",
+  "database_path": "../db/data-processing.db",
+  "log_directory": "../logs/data-processing/",
+  "retry_config": {
+    "max_attempts": 3,
+    "backoff_ms": 1000,
+    "exponential_backoff": true
+  },
+  "panic_config": {
+    "max_restart_attempts": 3,
+    "restart_delay_ms": 5000,
+    "enable_auto_restart": true
+  }
+}
+```
+
+**`config.json`** - Runtime configuration and environment variables:
+```json
+{
+  "environment": "production",
+  "variables": {
+    "API_TIMEOUT": "30000",
+    "BATCH_SIZE": "100",
+    "MAX_RETRIES": "3"
+  },
+  "secrets": {
+    "API_KEY": "env:DATA_API_KEY",
+    "DATABASE_URL": "env:DB_CONNECTION_STRING"
+  }
+}
+```
+
 ## Getting Started
 
 ### Prerequisites
@@ -546,74 +767,7 @@ cat > tsconfig.json << 'EOF'
 EOF
 ```
 
-## Library Structure
-
-```
-├── package.json                 # Root workspace configuration
-├── packages/                    # Core library packages
-│   ├── core/                    # Main workflow library
-│   │   ├── src/
-│   │   │   ├── workflow.ts      # Main Workflow class with fluent API
-│   │   │   ├── workflow.test.ts # Unit tests for workflow
-│   │   │   ├── context.ts       # WorkflowContext implementation
-│   │   │   ├── context.test.ts  # Unit tests for context
-│   │   │   ├── engine.ts        # Execution engine
-│   │   │   ├── engine.test.ts   # Unit tests for engine
-│   │   │   ├── state.ts         # State management
-│   │   │   ├── state.test.ts    # Unit tests for state
-│   │   │   └── index.ts         # Public exports
-│   │   ├── package.json         # Publishable package
-│   │   └── tsconfig.json
-│   ├── database/                # Per-workflow SQLite persistence
-│   │   ├── src/
-│   │   │   ├── schema.ts        # Database schema definitions
-│   │   │   ├── schema.test.ts   # Unit tests for schema
-│   │   │   ├── workflow-db.ts   # Per-workflow database management
-│   │   │   ├── workflow-db.test.ts # Unit tests for workflow DB
-│   │   │   ├── registry.ts      # Workflow registry and discovery
-│   │   │   ├── registry.test.ts # Unit tests for registry
-│   │   │   ├── connection.ts    # Connection management
-│   │   │   └── connection.test.ts # Unit tests for connection
-│   │   └── package.json
-│   ├── types/                   # TypeScript definitions
-│   │   ├── src/
-│   │   │   ├── workflow.ts      # Workflow types
-│   │   │   ├── context.ts       # Context types
-│   │   │   └── common.ts        # Common types
-│   │   └── package.json
-│   └── utils/                   # Utility functions
-│       ├── src/
-│       │   ├── logger.ts        # Logging utilities
-│       │   ├── logger.test.ts   # Unit tests for logger
-│       │   ├── validation.ts    # Validation helpers
-│       │   └── validation.test.ts # Unit tests for validation
-│       └── package.json
-├── apps/                        # Development tools
-│   └── cli/                     # CLI tool for debugging workflows
-│       ├── src/
-│       │   ├── index.ts         # CLI entry point
-│       │   ├── commands/        # CLI commands
-│       │   │   ├── list.ts      # List workflows command
-│       │   │   ├── create.ts    # Create workflow command
-│       │   │   ├── start.ts     # Start execution command
-│       │   │   ├── status.ts    # Check execution status
-│       │   │   ├── logs.ts      # View execution logs
-│       │   │   ├── inspect.ts   # Inspect workflow state
-│       │   │   └── cleanup.ts   # Cleanup old executions
-│       │   └── utils/           # CLI utilities
-│       │       ├── output.ts    # Output formatting
-│       │       ├── database.ts  # Database inspection tools
-│       │       └── config.ts    # CLI configuration
-│       └── tests/
-│           └── commands.test.ts # CLI command tests
-└── tests/                       # End-to-end test suites
-    └── e2e/                     # End-to-end tests
-        ├── workflow-execution.test.ts
-        ├── panic-recovery.test.ts
-        └── integration.test.ts
-```
-
-### 1. Core Library API
+## Core Library API
 
 **Main Workflow Class (@workflow/core)**
 ```typescript
