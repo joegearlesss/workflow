@@ -74,35 +74,33 @@ When workflows are executed, the library creates a runtime directory structure i
 ```
 ~/.workflow/                    # Runtime workflow data directory
 ├── registry.db                 # Central workflow registry database
-├── workflows/                  # Workflow definitions and metadata
-│   ├── data-processing/         # Per-workflow directory
-│   │   ├── definition.json      # Workflow definition metadata
-│   │   └── config.json          # Workflow-specific configuration
-│   ├── api-workflow/
-│   │   ├── definition.json
-│   │   └── config.json
-│   └── simple-log/
-│       ├── definition.json
-│       └── config.json
-├── db/                         # Database storage
-│   ├── data-processing.db       # Per-workflow database
-│   ├── api-workflow.db          # Per-workflow database
-│   └── simple-log.db            # Per-workflow database
-└── logs/                       # Execution logs
-    ├── data-processing/         # Per-workflow log directory
-    │   ├── 2024-01-15.log      # Daily log files
-    │   ├── 2024-01-16.log
-    │   └── executions/          # Per-execution detailed logs
-    │       ├── exec-123.log
-    │       └── exec-456.log
+└── workflows/                  # Workflow definitions and metadata
+    ├── data-processing/         # Per-workflow directory
+    │   ├── definition.json      # Workflow definition metadata
+    │   ├── config.json          # Workflow-specific configuration
+    │   ├── data-processing.db   # Per-workflow database
+    │   └── logs/                # Per-workflow execution logs
+    │       ├── 2024-01-15.log   # Daily log files
+    │       ├── 2024-01-16.log
+    │       └── executions/      # Per-execution detailed logs
+    │           ├── exec-123.log
+    │           └── exec-456.log
     ├── api-workflow/
-    │   ├── 2024-01-15.log
-    │   └── executions/
-    │       └── exec-789.log
+    │   ├── definition.json
+    │   ├── config.json
+    │   ├── api-workflow.db      # Per-workflow database
+    │   └── logs/                # Per-workflow execution logs
+    │       ├── 2024-01-15.log
+    │       └── executions/
+    │           └── exec-789.log
     └── simple-log/
-        ├── 2024-01-15.log
-        └── executions/
-            └── exec-abc.log
+        ├── definition.json
+        ├── config.json
+        ├── simple-log.db        # Per-workflow database
+        └── logs/                # Per-workflow execution logs
+            ├── 2024-01-15.log
+            └── executions/
+                └── exec-abc.log
 ```
 
 ### Database Structure
@@ -111,9 +109,9 @@ When workflows are executed, the library creates a runtime directory structure i
 ```sql
 CREATE TABLE workflow_registry (
     name TEXT PRIMARY KEY,
-    db_path TEXT NOT NULL,              -- Path: db/{workflow-name}.db
+    db_path TEXT NOT NULL,              -- Path: workflows/{workflow-name}/{workflow-name}.db
     workflow_dir TEXT NOT NULL,         -- Path: workflows/{workflow-name}/
-    log_dir TEXT NOT NULL,              -- Path: logs/{workflow-name}/
+    log_dir TEXT NOT NULL,              -- Path: workflows/{workflow-name}/logs/
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     last_execution_at DATETIME,
     execution_count INTEGER DEFAULT 0,
@@ -121,7 +119,7 @@ CREATE TABLE workflow_registry (
 );
 ```
 
-**Per-Workflow Database (`~/.workflow/db/{workflow-name}.db`)**
+**Per-Workflow Database (`~/.workflow/workflows/{workflow-name}/{workflow-name}.db`)**
 ```sql
 CREATE TABLE executions (
     id TEXT PRIMARY KEY,
@@ -170,10 +168,8 @@ CREATE TABLE step_errors (
 
 - **Automatic Creation**: The `~/.workflow/` directory and its subdirectories are created automatically on first workflow execution
 - **Organized Structure**: 
-  - `workflows/`: Contains workflow definitions and configuration files
-  - `db/`: Isolated database storage for each workflow
-  - `logs/`: Structured logging with daily logs and per-execution detailed logs
-- **Per-Workflow Isolation**: Each workflow gets its own subdirectory in `workflows/`, its own database in `db/`, and its own log directory in `logs/`
+  - `workflows/`: Contains workflow definitions, configuration files, databases, and logs
+- **Per-Workflow Isolation**: Each workflow gets its own subdirectory in `workflows/` containing definitions, config, database, and logs
 - **Registry Management**: The central registry tracks all workflows and their locations across the directory structure
 - **Cleanup**: Old execution data can be cleaned up using the CLI `cleanup` command
 - **Portability**: The entire `~/.workflow/` directory can be backed up or moved between systems
@@ -190,8 +186,8 @@ Each workflow directory in `~/.workflow/workflows/{workflow-name}/` contains:
   "description": "Process data from external APIs",
   "created_at": "2024-01-15T10:30:00Z",
   "last_modified": "2024-01-16T14:22:00Z",
-  "database_path": "../db/data-processing.db",
-  "log_directory": "../logs/data-processing/",
+  "database_path": "./data-processing.db",
+  "log_directory": "./logs/",
   "retry_config": {
     "max_attempts": 3,
     "backoff_ms": 1000,
