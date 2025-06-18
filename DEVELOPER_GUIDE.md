@@ -69,10 +69,10 @@
 
 ## Runtime Directory Structure
 
-When workflows are executed, the library creates a runtime directory structure in the user's home directory for persistence and state management:
+When workflows are executed, the library creates a runtime directory structure in the execution directory for persistence and state management:
 
 ```
-~/.workflow/                    # Runtime workflow data directory
+.workflow/                      # Runtime workflow data directory
 ├── registry.db                 # Central workflow registry database
 └── workflows/                  # Workflow definitions and metadata
     ├── data-processing/         # Per-workflow directory
@@ -105,7 +105,7 @@ When workflows are executed, the library creates a runtime directory structure i
 
 ### Database Structure
 
-**Central Registry (`~/.workflow/registry.db`)**
+**Central Registry (`.workflow/registry.db`)**
 ```sql
 CREATE TABLE workflow_registry (
     name TEXT PRIMARY KEY,
@@ -119,7 +119,7 @@ CREATE TABLE workflow_registry (
 );
 ```
 
-**Per-Workflow Database (`~/.workflow/workflows/{workflow-name}/{workflow-name}.db`)**
+**Per-Workflow Database (`.workflow/workflows/{workflow-name}/{workflow-name}.db`)**
 ```sql
 CREATE TABLE executions (
     id TEXT PRIMARY KEY,
@@ -166,17 +166,17 @@ CREATE TABLE step_errors (
 
 ### Directory Management
 
-- **Automatic Creation**: The `~/.workflow/` directory and its subdirectories are created automatically on first workflow execution
+- **Automatic Creation**: The `.workflow/` directory and its subdirectories are created automatically on first workflow execution
 - **Organized Structure**: 
   - `workflows/`: Contains workflow definitions, configuration files, databases, and logs
 - **Per-Workflow Isolation**: Each workflow gets its own subdirectory in `workflows/` containing definitions, config, database, and logs
 - **Registry Management**: The central registry tracks all workflows and their locations across the directory structure
 - **Cleanup**: Old execution data can be cleaned up using the CLI `cleanup` command
-- **Portability**: The entire `~/.workflow/` directory can be backed up or moved between systems
+- **Portability**: The entire `.workflow/` directory can be backed up or moved between systems
 
 ### Workflow Definition Files
 
-Each workflow directory in `~/.workflow/workflows/{workflow-name}/` contains:
+Each workflow directory in `.workflow/workflows/{workflow-name}/` contains:
 
 **`definition.json`** - Workflow metadata and configuration:
 ```json
