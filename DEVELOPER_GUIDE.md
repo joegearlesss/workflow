@@ -8,6 +8,43 @@
 - Functional programming familiarity
 - Zod for schema validation
 
+### TypeScript Best Practices
+
+> **Important:** This library strictly avoids `any` types to ensure type safety and better developer experience.
+
+**Type Safety Guidelines:**
+- Use `unknown` instead of `any` for truly unknown values
+- Use `Record<string, unknown>` for object types with unknown properties
+- Define specific interfaces for database row types and API responses
+- Use union types for known string literals (e.g., `'debug' | 'info' | 'warn' | 'error'`)
+- Leverage Zod schemas for runtime validation and type inference
+
+**Examples:**
+```typescript
+// ❌ Avoid
+function processData(data: any): any {
+  return data.someProperty;
+}
+
+// ✅ Prefer
+function processData(data: Record<string, unknown>): unknown {
+  return data.someProperty;
+}
+
+// ✅ Even better with specific types
+interface ProcessedData {
+  result: string;
+  timestamp: Date;
+}
+
+function processData(data: Record<string, unknown>): ProcessedData {
+  return {
+    result: String(data.someProperty),
+    timestamp: new Date()
+  };
+}
+```
+
 ### Library Installation
 
 ```bash
@@ -260,7 +297,12 @@ function getDefaultData() {
     return { default: true, data: "default-data" };
 }
 
-async function sendAlert(alert: any) {
+async function sendAlert(alert: {
+    type: string;
+    workflow: string;
+    execution: string;
+    error: string;
+}) {
     console.log("Alert sent:", alert);
 }
 ```
@@ -605,7 +647,7 @@ export namespace Workflow {
   export const start = async (
     name: string, 
     executionId: string, 
-    input?: any,
+    input?: Record<string, unknown>,
     retryConfig?: RetryConfig,
     panicConfig?: PanicConfig
   ): Promise<ExecutionResult> => {
@@ -821,7 +863,7 @@ class StepBuilder<T> {
   };
 }
 
-export const createContext = (workflowName: string, executionId: string, input?: any): WorkflowContext => {
+export const createContext = (workflowName: string, executionId: string, input?: Record<string, unknown>): WorkflowContext => {
   const state = StateManager.load(executionId);
   
   const context: WorkflowContext = {
@@ -880,13 +922,13 @@ import { z } from 'zod';
 // Zod schemas for runtime validation
 export const WorkflowDefinitionSchema = z.object({
   name: z.string().min(1, 'Workflow name is required'),
-  handler: z.function().args(z.any()).returns(z.promise(z.void()))
+  handler: z.function().args(z.record(z.unknown())).returns(z.promise(z.void()))
 });
 
 export const WorkflowContextSchema = z.object({
   workflowName: z.string(),
   executionId: z.string().uuid('Invalid execution ID format'),
-  input: z.any().optional(),
+  input: z.record(z.unknown()).optional(),
   attempt: z.number().int().positive(),
   restartAttempt: z.number().int().positive()
 });
@@ -902,7 +944,7 @@ export const StepStatusSchema = z.enum([
 export const StepResultSchema = z.object({
   stepId: z.string().min(1),
   status: StepStatusSchema,
-  result: z.any().optional(),
+  result: z.record(z.unknown()).optional(),
   error: z.instanceof(Error).optional(),
   startedAt: z.date(),
   completedAt: z.date().optional()
@@ -934,12 +976,12 @@ export const PanicConfigSchema = z.object({
 export const CircuitBreakerConfigSchema = z.object({
   failureThreshold: z.number().int().min(1),
   resetTimeout: z.number().int().min(1000),
-  onOpen: z.function().args(z.any()).returns(z.promise(z.void()))
+  onOpen: z.function().args(z.record(z.unknown())).returns(z.promise(z.void()))
 });
 
 export const ErrorHandlerSchema = z.function()
-  .args(z.instanceof(Error), z.any())
-  .returns(z.promise(z.any()));
+  .args(z.instanceof(Error), z.record(z.unknown()))
+  .returns(z.promise(z.record(z.unknown())));
 
 // TypeScript types inferred from Zod schemas
 export interface WorkflowDefinition extends z.infer<typeof WorkflowDefinitionSchema> {}
@@ -993,7 +1035,7 @@ export type Result<T, E = Error> =
 export const WorkflowInputSchema = z.object({
   workflowName: z.string().min(1),
   executionId: z.string().uuid(),
-  input: z.any().optional(),
+  input: z.record(z.unknown()).optional(),
   retryConfig: RetryConfigSchema.optional(),
   panicConfig: PanicConfigSchema.optional()
 });
@@ -1145,7 +1187,7 @@ export namespace WorkflowEngine {
     }
   };
   
-  const isSystemPanic = (error: any): boolean => {
+  const isSystemPanic = (error: unknown): boolean => {
     // Detect system-level panics that require restart
     const panicIndicators = [
       'out of memory',
@@ -1365,7 +1407,7 @@ import { WorkflowContextSchema, RetryConfigSchema, PanicConfigSchema, Validation
 export const createContext = (
   workflowName: string, 
   executionId: string, 
-  input?: any,
+  input?: Record<string, unknown>,
   retryConfig?: RetryConfig,
   panicConfig?: PanicConfig
 ): WorkflowContext => {
@@ -1573,7 +1615,7 @@ const executeStepWithValidation = async <T>(
   }
 };
 
-const isPanicError = (error: any): boolean => {
+const isPanicError = (error: unknown): boolean => {
   const panicIndicators = [
     'out of memory',
     'stack overflow',
@@ -2025,7 +2067,7 @@ const WorkflowDefinitionSchema = z.object({
 
 export const createCommand = async (name: string, options: CreateOptions): Promise<void> => {
   try {
-    let workflowDef: any;
+    let workflowDef: Record<string, unknown>;
 
     if (options.file) {
       // Load from file
@@ -2102,7 +2144,11 @@ export const createCommand = async (name: string, options: CreateOptions): Promi
   }
 };
 
-const executeStepByType = async (type: string, config: any, ctx: any): Promise<any> => {
+const executeStepByType = async (
+  type: string, 
+  config: Record<string, unknown>, 
+  ctx: Record<string, unknown>
+): Promise<Record<string, unknown>> => {
   switch (type) {
     case 'log':
       console.log(config.message || 'Step executed');
@@ -2165,7 +2211,7 @@ export const startCommand = async (workflowName: string, options: StartOptions):
     }
 
     // Parse input data
-    let inputData: any = {};
+    let inputData: Record<string, unknown> = {};
     if (options.inputFile) {
       if (!fs.existsSync(options.inputFile)) {
         logger.error(`Input file not found: ${options.inputFile}`);
@@ -2442,10 +2488,10 @@ export interface TableColumn {
   key: string;
   label: string;
   width: number;
-  format?: (value: any) => string;
+  format?: (value: unknown) => string;
 }
 
-export const formatTable = (data: any[], columns: TableColumn[]): string => {
+export const formatTable = (data: Record<string, unknown>[], columns: TableColumn[]): string => {
   if (data.length === 0) {
     return 'No data to display';
   }
@@ -2472,7 +2518,7 @@ export const formatTable = (data: any[], columns: TableColumn[]): string => {
   return lines.join('\n');
 };
 
-export const formatJson = (data: any): string => {
+export const formatJson = (data: unknown): string => {
   return JSON.stringify(data, null, 2);
 };
 ```
@@ -2486,7 +2532,7 @@ import os from 'os';
 export const CLIConfig = {
   workflowsDir: process.env.WORKFLOW_DIR || path.join(os.homedir(), '.workflows'),
   registryDbPath: process.env.WORKFLOW_REGISTRY_DB || undefined, // Will use default in workflowsDir
-  logLevel: (process.env.LOG_LEVEL as any) || 'info'
+  logLevel: (process.env.LOG_LEVEL as 'debug' | 'info' | 'warn' | 'error') || 'info'
 };
 ```
 
@@ -2685,7 +2731,7 @@ export namespace WorkflowRegistry {
 
     try {
       const stmt = registryDb.prepare('SELECT db_path FROM workflow_registry WHERE name = ?');
-      const row = stmt.get(workflowName) as any;
+      const row = stmt.get(workflowName) as { db_path: string } | undefined;
       
       if (!row) {
         return { success: true, data: null };
@@ -2713,7 +2759,14 @@ export namespace WorkflowRegistry {
         ORDER BY last_execution_at DESC, created_at DESC
       `);
       
-      const rows = stmt.all() as any[];
+      const rows = stmt.all() as Array<{
+        name: string;
+        db_path: string;
+        created_at: string;
+        last_execution_at: string | null;
+        execution_count: number;
+        status: string;
+      }>;
       
       const workflows: WorkflowInfo[] = rows.map(row => ({
         name: row.name,
@@ -2807,7 +2860,14 @@ export namespace WorkflowRegistry {
         WHERE name = ?
       `);
       
-      const row = stmt.get(workflowName) as any;
+      const row = stmt.get(workflowName) as {
+        name: string;
+        db_path: string;
+        created_at: string;
+        last_execution_at: string | null;
+        execution_count: number;
+        status: string;
+      } | undefined;
       
       if (!row) {
         return { success: true, data: null };
@@ -2981,7 +3041,15 @@ export namespace WorkflowDatabase {
       
       // Load execution
       const execStmt = db.prepare('SELECT * FROM executions WHERE id = ?');
-      const execRow = execStmt.get(executionId) as any;
+      const execRow = execStmt.get(executionId) as {
+        id: string;
+        status: string;
+        started_at: string;
+        completed_at: string | null;
+        restart_attempt: number;
+        error_message: string | null;
+        input_data: string | null;
+      } | undefined;
       
       if (!execRow) {
         return { success: true, data: null };
@@ -2989,7 +3057,16 @@ export namespace WorkflowDatabase {
 
       // Load steps
       const stepsStmt = db.prepare('SELECT * FROM steps WHERE execution_id = ?');
-      const stepRows = stepsStmt.all(executionId) as any[];
+      const stepRows = stepsStmt.all(executionId) as Array<{
+        execution_id: string;
+        step_id: string;
+        status: string;
+        started_at: string;
+        completed_at: string | null;
+        result_data: string | null;
+        error_message: string | null;
+        attempt: number;
+      }>;
       
       const steps: Record<string, StepResult> = {};
       for (const stepRow of stepRows) {
@@ -3040,7 +3117,7 @@ export namespace WorkflowDatabase {
       const db = dbResult.data;
       
       let query = 'SELECT * FROM executions';
-      const params: any[] = [];
+      const params: unknown[] = [];
       
       if (options.status) {
         query += ' WHERE status = ?';
@@ -3060,7 +3137,15 @@ export namespace WorkflowDatabase {
       }
 
       const stmt = db.prepare(query);
-      const rows = stmt.all(...params) as any[];
+      const rows = stmt.all(...params) as Array<{
+        id: string;
+        status: string;
+        started_at: string;
+        completed_at: string | null;
+        restart_attempt: number;
+        error_message: string | null;
+        input_data: string | null;
+      }>;
       
       const executions: ExecutionResult[] = [];
       
@@ -3347,7 +3432,7 @@ describe('WorkflowContext', () => {
     const context = createContext('test-workflow', crypto.randomUUID(), {});
     
     // Circular reference should fail validation
-    const circularObj: any = { name: 'test' };
+    const circularObj: Record<string, unknown> = { name: 'test' };
     circularObj.self = circularObj;
     
     await expect(context.step('circular-step', async () => circularObj))
@@ -3380,7 +3465,7 @@ describe('Workflow', () => {
     expect(() => Workflow.define('', async () => {}))
       .toThrow(ValidationError);
     
-    expect(() => Workflow.define('valid-name', null as any))
+    expect(() => Workflow.define('valid-name', null as unknown as (ctx: WorkflowContext) => Promise<void>))
       .toThrow(ValidationError);
   });
 
