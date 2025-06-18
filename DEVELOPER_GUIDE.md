@@ -18,16 +18,36 @@
 │   │   │   └── index.ts         # Public exports
 │   │   ├── package.json         # Publishable package
 │   │   └── tsconfig.json
-│   ├── database/                # Per-workflow SQLite persistence
+│   ├── registry-db/             # Central registry database management
 │   │   ├── src/
-│   │   │   ├── schema.ts        # Database schema definitions
-│   │   │   ├── schema.test.ts   # Unit tests for schema
-│   │   │   ├── workflow-db.ts   # Per-workflow database management
-│   │   │   ├── workflow-db.test.ts # Unit tests for workflow DB
-│   │   │   ├── registry.ts      # Workflow registry and discovery
-│   │   │   ├── registry.test.ts # Unit tests for registry
-│   │   │   ├── connection.ts    # Connection management
-│   │   │   └── connection.test.ts # Unit tests for connection
+│   │   │   ├── schema.ts        # Registry database schema definitions
+│   │   │   ├── schema.test.ts   # Unit tests for registry schema
+│   │   │   ├── registry.ts      # Registry database operations
+│   │   │   ├── registry.test.ts # Unit tests for registry operations
+│   │   │   ├── connection.ts    # Registry database connection management
+│   │   │   ├── connection.test.ts # Unit tests for registry connection
+│   │   │   ├── migrations.ts    # Registry migration management
+│   │   │   └── index.ts         # Public exports
+│   │   ├── migrations/          # Registry migration files
+│   │   │   ├── 001_initial_schema.sql
+│   │   │   ├── 002_add_execution_count.sql
+│   │   │   └── 003_add_status_index.sql
+│   │   └── package.json
+│   ├── workflow-db/             # Per-workflow database management
+│   │   ├── src/
+│   │   │   ├── schema.ts        # Workflow database schema definitions
+│   │   │   ├── schema.test.ts   # Unit tests for workflow schema
+│   │   │   ├── workflow-db.ts   # Per-workflow database operations
+│   │   │   ├── workflow-db.test.ts # Unit tests for workflow database
+│   │   │   ├── connection.ts    # Workflow database connection management
+│   │   │   ├── connection.test.ts # Unit tests for workflow connection
+│   │   │   ├── migrations.ts    # Workflow migration management
+│   │   │   └── index.ts         # Public exports
+│   │   ├── migrations/          # Workflow migration files
+│   │   │   ├── 001_initial_schema.sql
+│   │   │   ├── 002_add_circuit_breaker.sql
+│   │   │   ├── 003_add_error_logging.sql
+│   │   │   └── 004_add_step_metadata.sql
 │   │   └── package.json
 │   ├── types/                   # TypeScript definitions
 │   │   ├── src/
@@ -163,6 +183,697 @@ CREATE TABLE step_errors (
     INDEX idx_execution_step (execution_id, step_id)
 );
 ```
+
+### Database Migration Management
+
+The workflow library includes a comprehensive migration system for managing SQLite schema changes across both the central registry and per-workflow databases.
+
+#### Migration Structure
+
+The workflow library has **two types of databases** with different schemas, each managed by separate packages:
+
+1. **Registry Database** (`@workflow/registry-db`) - Single central database tracking all workflows
+2. **Workflow Databases** (`@workflow/workflow-db`) - Per-workflow databases (all share the same schema)
+
+```
+packages/
+├── registry-db/                    # Registry database package
+│   ├── migrations/                 # Registry migration files (source controlled)
+│   │   ├── 001_initial_schema.sql
+│   │   ├── 002_add_execution_count.sql
+│   │   └── 003_add_status_index.sql
+│   └── src/
+│       ├── migrations.ts           # Registry migration management
+│       ├── schema.ts               # Registry schema definitions
+│       └── registry.ts             # Registry operations
+└── workflow-db/                    # Workflow database package
+    ├── migrations/                 # Workflow migration files (source controlled)
+    │   ├── 001_initial_schema.sql
+    │   ├── 002_add_circuit_breaker.sql
+    │   ├── 003_add_error_logging.sql
+    │   └── 004_add_step_metadata.sql
+    └── src/
+        ├── migrations.ts           # Workflow migration management
+        ├── schema.ts               # Workflow schema definitions
+        └── workflow-db.ts          # Workflow database operations
+
+.workflow/                          # Runtime data (not source controlled)
+├── registry.db                    # Central registry database
+└── workflows/                     # Per-workflow databases
+    ├── data-processing/
+    │   └── data-processing.db     # Workflow database (same schema as others)
+    └── api-workflow/
+        └── api-workflow.db        # Workflow database (same schema as others)
+```
+
+**Package Separation Benefits:**
+- **Clear Responsibility**: Each package manages one database type
+- **Independent Versioning**: Registry and workflow schemas can evolve independently  
+- **Focused Dependencies**: Each package only includes what it needs
+- **Better Testing**: Isolated unit tests for each database type
+- **Modular Usage**: Applications can import only the database types they need
+
+#### Migration Files
+
+**Registry Migration Example (`packages/registry-db/migrations/002_add_execution_count.sql`)**
+```sql
+-- Migration: Add execution tracking to workflow registry
+-- Version: 002
+-- Description: Add execution count and last execution timestamp
+-- Author: System
+-- Date: 2024-01-15
+
+BEGIN TRANSACTION;
+
+-- Add new columns to workflow_registry
+ALTER TABLE workflow_registry 
+ADD COLUMN execution_count INTEGER DEFAULT 0;
+
+ALTER TABLE workflow_registry 
+ADD COLUMN last_execution_at DATETIME;
+
+-- Create index for performance
+CREATE INDEX idx_workflow_last_execution 
+ON workflow_registry(last_execution_at);
+
+-- Update migration history
+INSERT INTO migration_history (version, name, description, applied_at)
+VALUES (2, 'add_execution_count', 'Add execution tracking to workflow registry', CURRENT_TIMESTAMP);
+
+COMMIT;
+```
+
+**Workflow Migration Example (`packages/workflow-db/migrations/003_add_error_logging.sql`)**
+```sql
+-- Migration: Add comprehensive error logging
+-- Version: 003
+-- Description: Add step error logging table with detailed error tracking
+-- Author: System
+-- Date: 2024-01-16
+
+BEGIN TRANSACTION;
+
+-- Create step_errors table for detailed error logging
+CREATE TABLE step_errors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    execution_id TEXT NOT NULL,
+    step_id TEXT NOT NULL,
+    error_message TEXT NOT NULL,
+    error_stack TEXT,
+    error_type TEXT,
+    attempt INTEGER NOT NULL,
+    timestamp INTEGER NOT NULL,
+    context_data TEXT, -- JSON string for additional context
+    FOREIGN KEY (execution_id) REFERENCES executions (id) ON DELETE CASCADE
+);
+
+-- Create indexes for efficient querying
+CREATE INDEX idx_step_errors_execution ON step_errors(execution_id);
+CREATE INDEX idx_step_errors_step ON step_errors(step_id);
+CREATE INDEX idx_step_errors_timestamp ON step_errors(timestamp);
+CREATE INDEX idx_step_errors_type ON step_errors(error_type);
+
+-- Update migration history
+INSERT INTO migration_history (version, name, description, applied_at)
+VALUES (3, 'add_error_logging', 'Add comprehensive error logging table', CURRENT_TIMESTAMP);
+
+COMMIT;
+```
+
+#### Migration History Tracking
+
+**Migration History Schema**
+```sql
+CREATE TABLE migration_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    version INTEGER NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    description TEXT,
+    checksum TEXT, -- SHA-256 hash of migration content
+    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    applied_by TEXT DEFAULT 'system',
+    execution_time_ms INTEGER,
+    rollback_sql TEXT -- Optional rollback instructions
+);
+
+CREATE INDEX idx_migration_version ON migration_history(version);
+CREATE INDEX idx_migration_applied_at ON migration_history(applied_at);
+```
+
+#### Migration Management API
+
+**Registry Migration Manager (`packages/registry-db/src/migrations.ts`)**
+```typescript
+import { z } from 'zod';
+import { RegistryConnection } from './connection';
+import { createHash } from 'crypto';
+import { readFileSync, readdirSync } from 'fs';
+import { join } from 'path';
+
+export namespace RegistryMigrationManager {
+  export const migrate = async (): Promise<void> => {
+    const db = RegistryConnection.getConnection();
+    await ensureMigrationHistoryTable(db);
+    
+    const migrations = await loadMigrations();
+    const appliedVersions = await getAppliedVersions(db);
+    
+    const pendingMigrations = migrations.filter(
+      m => !appliedVersions.includes(m.version)
+    );
+    
+    if (pendingMigrations.length === 0) {
+      console.log('Registry database is up to date');
+      return;
+    }
+    
+    console.log(`Applying ${pendingMigrations.length} registry migrations...`);
+    
+    for (const migration of pendingMigrations) {
+      await applyMigration(db, migration);
+    }
+    
+    console.log('Registry migrations completed successfully');
+  };
+
+  const loadMigrations = async (): Promise<Migration[]> => {
+    return loadMigrationsFromDirectory(join(__dirname, '..', 'migrations'));
+  };
+
+  // ... other migration management methods
+}
+```
+
+**Workflow Migration Manager (`packages/workflow-db/src/migrations.ts`)**
+```typescript
+import { z } from 'zod';
+import { WorkflowConnection } from './connection';
+import { createHash } from 'crypto';
+import { readFileSync, readdirSync } from 'fs';
+import { join } from 'path';
+
+export namespace WorkflowMigrationManager {
+  export const migrate = async (workflowName: string): Promise<void> => {
+    const db = WorkflowConnection.getConnection(workflowName);
+    await ensureMigrationHistoryTable(db);
+    
+    const migrations = await loadMigrations();
+    const appliedVersions = await getAppliedVersions(db);
+    
+    const pendingMigrations = migrations.filter(
+      m => !appliedVersions.includes(m.version)
+    );
+    
+    if (pendingMigrations.length === 0) {
+      console.log(`Workflow database '${workflowName}' is up to date`);
+      return;
+    }
+    
+    console.log(`Applying ${pendingMigrations.length} migrations to workflow '${workflowName}'...`);
+    
+    for (const migration of pendingMigrations) {
+      await applyMigration(db, migration);
+    }
+    
+    console.log(`Workflow '${workflowName}' migrations completed successfully`);
+  };
+
+  export const migrateAll = async (): Promise<void> => {
+    const workflowNames = await getWorkflowList();
+    
+    for (const workflowName of workflowNames) {
+      await migrate(workflowName);
+    }
+  };
+
+  const loadMigrations = async (): Promise<Migration[]> => {
+    return loadMigrationsFromDirectory(join(__dirname, '..', 'migrations'));
+  };
+
+  // ... other migration management methods
+}
+```
+
+#### Migration CLI Commands (`apps/cli/src/commands/migrate.ts`)**
+  
+  // Rollback to specific version
+  export const rollbackTo = async (
+    db: DatabaseConnection, 
+    targetVersion: number,
+    dbType: string
+  ): Promise<void> => {
+    const currentVersion = await getCurrentVersion(db);
+    
+    if (targetVersion >= currentVersion) {
+      throw new Error(`Target version ${targetVersion} is not less than current version ${currentVersion}`);
+    }
+    
+    const migrationsToRollback = await db.query(
+      'SELECT * FROM migration_history WHERE version > ? ORDER BY version DESC',
+      [targetVersion]
+    );
+    
+    console.log(`Rolling back ${migrationsToRollback.length} migrations in ${dbType}...`);
+    
+    for (const migration of migrationsToRollback) {
+      if (!migration.rollback_sql) {
+        throw new Error(`Migration ${migration.version} (${migration.name}) has no rollback SQL`);
+      }
+      
+      console.log(`Rolling back migration ${migration.version}: ${migration.name}`);
+      
+      const startTime = Date.now();
+      
+      try {
+        await db.exec(migration.rollback_sql);
+        await db.query(
+          'DELETE FROM migration_history WHERE version = ?',
+          [migration.version]
+        );
+        
+        const executionTime = Date.now() - startTime;
+        console.log(`Rolled back migration ${migration.version} in ${executionTime}ms`);
+        
+      } catch (error) {
+        console.error(`Failed to rollback migration ${migration.version}:`, error);
+        throw error;
+      }
+    }
+    
+    console.log(`Rollback to version ${targetVersion} completed successfully`);
+  };
+  
+  // Validate migration integrity
+  export const validateMigrations = async (db: DatabaseConnection): Promise<boolean> => {
+    const appliedMigrations = await db.query(
+      'SELECT version, name, checksum FROM migration_history ORDER BY version'
+    );
+    
+    for (const applied of appliedMigrations) {
+      // Load original migration file and verify checksum
+      const migrationPath = getMigrationPath(applied.version, applied.name);
+      if (!migrationPath) {
+        console.warn(`Migration file not found for version ${applied.version}: ${applied.name}`);
+        continue;
+      }
+      
+      const content = readFileSync(migrationPath, 'utf8');
+      const expectedChecksum = createHash('sha256').update(content).digest('hex');
+      
+      if (applied.checksum !== expectedChecksum) {
+        console.error(`Checksum mismatch for migration ${applied.version}: ${applied.name}`);
+        console.error(`Expected: ${expectedChecksum}`);
+        console.error(`Actual: ${applied.checksum}`);
+        return false;
+      }
+    }
+    
+    return true;
+  };
+  
+  // Create new migration file
+  export const createMigration = async (
+    type: 'registry' | 'workflow',
+    name: string,
+    description?: string
+  ): Promise<string> => {
+    const migrations = type === 'registry' 
+      ? await loadRegistryMigrations()
+      : await loadWorkflowMigrations();
+    
+    const nextVersion = Math.max(...migrations.map(m => m.version), 0) + 1;
+    const filename = `${nextVersion.toString().padStart(3, '0')}_${name}.sql`;
+    const migrationDir = join(__dirname, '..', 'migrations', type);
+    const filepath = join(migrationDir, filename);
+    
+    const template = `-- Migration: ${description || name}
+-- Version: ${nextVersion}
+-- Description: ${description || 'Add description here'}
+-- Author: ${process.env.USER || 'system'}
+-- Date: ${new Date().toISOString().split('T')[0]}
+
+BEGIN TRANSACTION;
+
+-- Add your migration SQL here
+-- Example:
+-- CREATE TABLE example (
+--     id INTEGER PRIMARY KEY,
+--     name TEXT NOT NULL
+-- );
+
+-- Update migration history (required)
+INSERT INTO migration_history (version, name, description, applied_at)
+VALUES (${nextVersion}, '${name}', '${description || 'Add description here'}', CURRENT_TIMESTAMP);
+
+COMMIT;
+
+-- Rollback SQL (optional but recommended)
+-- BEGIN TRANSACTION;
+-- DROP TABLE IF EXISTS example;
+-- DELETE FROM migration_history WHERE version = ${nextVersion};
+-- COMMIT;
+`;
+    
+    // Ensure migration directory exists
+    await ensureDirectoryExists(migrationDir);
+    
+    // Write migration file
+    writeFileSync(filepath, template);
+    
+    console.log(`Created migration file: ${filepath}`);
+    return filepath;
+  };
+  
+  // Private helper functions
+  const ensureMigrationHistoryTable = async (db: DatabaseConnection): Promise<void> => {
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS migration_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        version INTEGER NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        description TEXT,
+        checksum TEXT,
+        applied_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        applied_by TEXT DEFAULT 'system',
+        execution_time_ms INTEGER,
+        rollback_sql TEXT
+      )
+    `);
+    
+    await db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_migration_version 
+      ON migration_history(version)
+    `);
+  };
+  
+  const loadRegistryMigrations = async (): Promise<Migration[]> => {
+    return loadMigrationsFromDirectory(join(__dirname, '..', 'migrations', 'registry'));
+  };
+  
+  const loadWorkflowMigrations = async (): Promise<Migration[]> => {
+    return loadMigrationsFromDirectory(join(__dirname, '..', 'migrations', 'workflow'));
+  };
+  
+  const loadMigrationsFromDirectory = async (dir: string): Promise<Migration[]> => {
+    if (!existsSync(dir)) {
+      return [];
+    }
+    
+    const files = readdirSync(dir)
+      .filter(f => f.endsWith('.sql'))
+      .sort();
+    
+    const migrations: Migration[] = [];
+    
+    for (const file of files) {
+      const filepath = join(dir, file);
+      const content = readFileSync(filepath, 'utf8');
+      const checksum = createHash('sha256').update(content).digest('hex');
+      
+      // Parse migration metadata from comments
+      const versionMatch = content.match(/-- Version: (\d+)/);
+      const nameMatch = content.match(/-- Migration: (.+)/);
+      const descriptionMatch = content.match(/-- Description: (.+)/);
+      
+      if (!versionMatch || !nameMatch) {
+        console.warn(`Invalid migration file format: ${file}`);
+        continue;
+      }
+      
+      const migration: Migration = {
+        version: parseInt(versionMatch[1]),
+        name: nameMatch[1].trim(),
+        description: descriptionMatch?.[1]?.trim(),
+        sql: content,
+        checksum
+      };
+      
+      // Extract rollback SQL if present
+      const rollbackMatch = content.match(/-- Rollback SQL[^]*?BEGIN TRANSACTION;([^]*?)COMMIT;/s);
+      if (rollbackMatch) {
+        migration.rollbackSql = `BEGIN TRANSACTION;${rollbackMatch[1]}COMMIT;`;
+      }
+      
+      migrations.push(migration);
+    }
+    
+    return migrations;
+  };
+  
+  const getAppliedVersions = async (db: DatabaseConnection): Promise<number[]> => {
+    const result = await db.query('SELECT version FROM migration_history ORDER BY version');
+    return result.map(row => row.version);
+  };
+  
+  const applyMigration = async (
+    db: DatabaseConnection, 
+    migration: Migration, 
+    dbType: string
+  ): Promise<void> => {
+    console.log(`Applying migration ${migration.version}: ${migration.name}`);
+    
+    const startTime = Date.now();
+    
+    try {
+      // Execute migration SQL
+      await db.exec(migration.sql);
+      
+      const executionTime = Date.now() - startTime;
+      
+      // Record migration in history (if not already recorded by migration SQL)
+      const existing = await db.query(
+        'SELECT version FROM migration_history WHERE version = ?',
+        [migration.version]
+      );
+      
+      if (existing.length === 0) {
+        await db.query(`
+          INSERT INTO migration_history 
+          (version, name, description, checksum, applied_by, execution_time_ms, rollback_sql)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `, [
+          migration.version,
+          migration.name,
+          migration.description,
+          migration.checksum,
+          process.env.USER || 'system',
+          executionTime,
+          migration.rollbackSql
+        ]);
+      }
+      
+      console.log(`Applied migration ${migration.version} in ${executionTime}ms`);
+      
+    } catch (error) {
+      console.error(`Failed to apply migration ${migration.version}:`, error);
+      throw error;
+    }
+  };
+}
+```
+
+#### CLI Migration Commands
+
+**Migration CLI Commands (`apps/cli/src/commands/migrate.ts`)**
+```typescript
+import { Command } from 'commander';
+import { RegistryMigrationManager } from '@workflow/registry-db';
+import { WorkflowMigrationManager } from '@workflow/workflow-db';
+
+export const migrateCommand = new Command('migrate')
+  .description('Database migration management')
+  .addCommand(
+    new Command('up')
+      .description('Apply all pending migrations')
+      .option('--registry', 'Migrate registry database only')
+      .option('--workflow <name>', 'Migrate specific workflow database')
+      .action(async (options) => {
+        if (options.registry) {
+          await RegistryMigrationManager.migrate();
+        } else if (options.workflow) {
+          await WorkflowMigrationManager.migrate(options.workflow);
+        } else {
+          // Migrate all databases
+          await RegistryMigrationManager.migrate();
+          await WorkflowMigrationManager.migrateAll();
+        }
+      })
+  )
+  .addCommand(
+    new Command('rollback')
+      .description('Rollback to specific version')
+      .requiredOption('--version <number>', 'Target version number')
+      .option('--registry', 'Rollback registry database')
+      .option('--workflow <name>', 'Rollback specific workflow database')
+      .action(async (options) => {
+        const targetVersion = parseInt(options.version);
+        
+        if (options.registry) {
+          await RegistryMigrationManager.rollbackTo(targetVersion);
+        } else if (options.workflow) {
+          await WorkflowMigrationManager.rollbackTo(options.workflow, targetVersion);
+        } else {
+          throw new Error('Must specify --registry or --workflow');
+        }
+      })
+  )
+  .addCommand(
+    new Command('status')
+      .description('Show migration status')
+      .option('--registry', 'Show registry migration status')
+      .option('--workflow <name>', 'Show workflow migration status')
+      .action(async (options) => {
+        if (options.registry) {
+          await RegistryMigrationManager.showStatus();
+        } else if (options.workflow) {
+          await WorkflowMigrationManager.showStatus(options.workflow);
+        } else {
+          await RegistryMigrationManager.showStatus();
+          await WorkflowMigrationManager.showStatusAll();
+        }
+      })
+  )
+  .addCommand(
+    new Command('create')
+      .description('Create new migration file')
+      .requiredOption('--name <name>', 'Migration name')
+      .requiredOption('--type <type>', 'Migration type (registry|workflow)')
+      .option('--description <desc>', 'Migration description')
+      .action(async (options) => {
+        let filepath: string;
+        
+        if (options.type === 'registry') {
+          filepath = await RegistryMigrationManager.createMigration(
+            options.name,
+            options.description
+          );
+        } else if (options.type === 'workflow') {
+          filepath = await WorkflowMigrationManager.createMigration(
+            options.name,
+            options.description
+          );
+        } else {
+          throw new Error('Migration type must be "registry" or "workflow"');
+        }
+        
+        console.log(`Migration created: ${filepath}`);
+      })
+  );
+```
+
+**Package Dependencies**
+
+**Registry Database Package (`packages/registry-db/package.json`)**
+```json
+{
+  "name": "@workflow/registry-db",
+  "version": "1.0.0",
+  "description": "Registry database management for workflow library",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "dependencies": {
+    "@workflow/types": "workspace:*",
+    "@workflow/utils": "workspace:*",
+    "zod": "^3.22.0",
+    "better-sqlite3": "^8.7.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/better-sqlite3": "^7.6.0"
+  }
+}
+```
+
+**Workflow Database Package (`packages/workflow-db/package.json`)**
+```json
+{
+  "name": "@workflow/workflow-db",
+  "version": "1.0.0", 
+  "description": "Per-workflow database management for workflow library",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "dependencies": {
+    "@workflow/types": "workspace:*",
+    "@workflow/utils": "workspace:*",
+    "zod": "^3.22.0",
+    "better-sqlite3": "^8.7.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/better-sqlite3": "^7.6.0"
+  }
+}
+```
+
+**Core Package Updated Dependencies (`packages/core/package.json`)**
+```json
+{
+  "name": "@workflow/core",
+  "dependencies": {
+    "@workflow/types": "workspace:*",
+    "@workflow/registry-db": "workspace:*",
+    "@workflow/workflow-db": "workspace:*",
+    "@workflow/utils": "workspace:*",
+    "zod": "^3.22.0"
+  }
+}
+```
+```
+
+#### Usage Examples
+
+**Apply All Migrations**
+```bash
+# Apply all pending migrations to all databases
+workflow migrate up
+
+# Apply migrations to registry only
+workflow migrate up --registry
+
+# Apply migrations to specific workflow
+workflow migrate up --workflow data-processing
+```
+
+**Check Migration Status**
+```bash
+# Show status of all databases
+workflow migrate status
+
+# Show registry migration status
+workflow migrate status --registry
+
+# Show specific workflow migration status
+workflow migrate status --workflow api-workflow
+```
+
+**Create New Migration**
+```bash
+# Create registry migration
+workflow migrate create --type registry --name add_workflow_tags --description "Add tagging support to workflows"
+
+# Create workflow migration
+workflow migrate create --type workflow --name add_step_timeout --description "Add timeout configuration for steps"
+```
+
+**Rollback Migrations**
+```bash
+# Rollback registry to version 3
+workflow migrate rollback --registry --version 3
+
+# Rollback workflow to version 2
+workflow migrate rollback --workflow data-processing --version 2
+```
+
+#### Migration Best Practices
+
+1. **Version Control**: Store migration files in version control alongside code
+2. **Atomic Operations**: Use transactions to ensure migrations are atomic
+3. **Rollback Support**: Always provide rollback SQL when possible
+4. **Testing**: Test migrations on development databases before production
+5. **Backup**: Always backup databases before applying migrations
+6. **Documentation**: Include clear descriptions and comments in migration files
+7. **Validation**: Validate migration integrity using checksums
+8. **Incremental**: Keep migrations small and focused on single changes
 
 ### Directory Management
 
