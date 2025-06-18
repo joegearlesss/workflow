@@ -101,12 +101,14 @@ EOF
 │   │   │   └── index.ts         # Public exports
 │   │   ├── package.json         # Publishable package
 │   │   └── tsconfig.json
-│   ├── database/                # SQLite persistence
+│   ├── database/                # Per-workflow SQLite persistence
 │   │   ├── src/
-│   │   │   ├── schema.ts        # Database schema
+│   │   │   ├── schema.ts        # Database schema definitions
 │   │   │   ├── schema.test.ts   # Unit tests for schema
-│   │   │   ├── repository.ts    # Data access layer
-│   │   │   ├── repository.test.ts # Unit tests for repository
+│   │   │   ├── workflow-db.ts   # Per-workflow database management
+│   │   │   ├── workflow-db.test.ts # Unit tests for workflow DB
+│   │   │   ├── registry.ts      # Workflow registry and discovery
+│   │   │   ├── registry.test.ts # Unit tests for registry
 │   │   │   ├── connection.ts    # Connection management
 │   │   │   └── connection.test.ts # Unit tests for connection
 │   │   └── package.json
@@ -156,10 +158,20 @@ EOF
 │   │   ├── src/
 │   │   │   ├── index.ts
 │   │   │   └── index.test.ts    # CLI tests
-│   └── dashboard/               # Web dashboard
+│   └── cli/                     # CLI tool for workflow management
 │       ├── src/
-│       │   ├── index.ts
-│       │   └── index.test.ts    # Dashboard tests
+│       │   ├── index.ts         # CLI entry point
+│       │   ├── commands/        # CLI commands
+│       │   │   ├── list.ts      # List workflows command
+│       │   │   ├── create.ts    # Create workflow command
+│       │   │   ├── start.ts     # Start execution command
+│       │   │   ├── status.ts    # Check execution status
+│       │   │   └── cleanup.ts   # Cleanup old executions
+│       │   └── utils/           # CLI utilities
+│       │       ├── output.ts    # Output formatting
+│       │       └── config.ts    # CLI configuration
+│       └── tests/
+│           └── commands.test.ts # CLI command tests
 └── tests/                       # End-to-end test suites
     └── e2e/                     # End-to-end tests
         ├── workflow-execution.test.ts
@@ -1909,147 +1921,699 @@ export namespace StepExecutor {
 }
 ```
 
-**Database Package (@workflow/database)**
-```typescript
-// packages/database/src/repository.ts
-import { Database } from "bun:sqlite";
-import type { Result, Workflow } from '@workflow/types';
+### CLI Application (apps/cli)
 
-export namespace WorkflowRepository {
-  export const save = async (db: Database, workflow: Workflow.Instance): Promise<Result<void>> => {
-    try {
-      const stmt = db.prepare(`
-        INSERT INTO workflows (id, name, definition, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?)
-      `);
-      
-      stmt.run(
-        workflow.definition.id,
-        workflow.definition.name,
-        JSON.stringify(workflow.definition),
-        workflow.createdAt.toISOString(),
-        new Date().toISOString()
-      );
-      
-      return { success: true, data: undefined };
-    } catch (error) {
-      return { 
-        success: false, 
-        error: error instanceof Error ? error : new Error(String(error))
-      };
-    }
-  };
-  
-  export const findById = async (db: Database, id: string): Promise<Result<Workflow.Instance | null>> => {
-    try {
-      const stmt = db.prepare("SELECT * FROM workflows WHERE id = ?");
-      const row = stmt.get(id) as any;
-      
-      if (!row) {
-        return { success: true, data: null };
-      }
-      
-      const workflow: Workflow.Instance = {
-        definition: JSON.parse(row.definition),
-        createdAt: new Date(row.created_at),
-        version: 1
-      };
-      
-      return { success: true, data: workflow };
-    } catch (error) {
-      return { 
-        success: false, 
-        error: error instanceof Error ? error : new Error(String(error))
-      };
-    }
-  };
-  
-  export const findAll = async (db: Database): Promise<Result<Workflow.Instance[]>> => {
-    try {
-      const stmt = db.prepare("SELECT * FROM workflows ORDER BY created_at DESC");
-      const rows = stmt.all() as any[];
-      
-      const workflows: Workflow.Instance[] = rows.map(row => ({
-        definition: JSON.parse(row.definition),
-        createdAt: new Date(row.created_at),
-        version: 1
-      }));
-      
-      return { success: true, data: workflows };
-    } catch (error) {
-      return { 
-        success: false, 
-        error: error instanceof Error ? error : new Error(String(error))
-      };
-    }
-  };
+The CLI provides command-line interface for workflow management, execution monitoring, and system administration without requiring a web interface.
+
+**CLI Entry Point**
+```typescript
+// apps/cli/src/index.ts
+#!/usr/bin/env bun
+import { Command } from 'commander';
+import { WorkflowRegistry } from '@workflow/database';
+import { Logger } from '@workflow/utils';
+import { listCommand } from './commands/list';
+import { createCommand } from './commands/create';
+import { startCommand } from './commands/start';
+import { statusCommand } from './commands/status';
+import { cleanupCommand } from './commands/cleanup';
+import { CLIConfig } from './utils/config';
+
+const program = new Command();
+const logger = Logger.create('cli');
+
+// Initialize workflow registry
+WorkflowRegistry.initialize({
+  baseDir: CLIConfig.workflowsDir,
+  registryDbPath: CLIConfig.registryDbPath
+});
+
+program
+  .name('workflow')
+  .description('Workflow management CLI')
+  .version('1.0.0');
+
+// List workflows command
+program
+  .command('list')
+  .alias('ls')
+  .description('List all workflows')
+  .option('-s, --status <status>', 'Filter by status (active|inactive)')
+  .option('-f, --format <format>', 'Output format (table|json)', 'table')
+  .action(listCommand);
+
+// Create workflow command
+program
+  .command('create <name>')
+  .description('Create a new workflow')
+  .option('-d, --description <description>', 'Workflow description')
+  .option('-f, --file <file>', 'Load workflow definition from file')
+  .option('--dry-run', 'Validate without creating')
+  .action(createCommand);
+
+// Start execution command
+program
+  .command('start <workflow>')
+  .description('Start workflow execution')
+  .option('-i, --input <input>', 'Input data as JSON string')
+  .option('-f, --input-file <file>', 'Load input from file')
+  .option('--execution-id <id>', 'Custom execution ID (UUID)')
+  .option('--max-retries <count>', 'Maximum retry attempts', '3')
+  .option('--retry-delay <ms>', 'Retry delay in milliseconds', '1000')
+  .action(startCommand);
+
+// Status command
+program
+  .command('status [execution-id]')
+  .description('Check execution status')
+  .option('-w, --workflow <name>', 'Show status for specific workflow')
+  .option('-f, --format <format>', 'Output format (table|json)', 'table')
+  .option('--follow', 'Follow execution progress')
+  .action(statusCommand);
+
+// Cleanup command
+program
+  .command('cleanup')
+  .description('Clean up old executions and databases')
+  .option('--older-than <days>', 'Remove executions older than N days', '30')
+  .option('--status <status>', 'Only remove executions with specific status')
+  .option('--dry-run', 'Show what would be removed without deleting')
+  .action(cleanupCommand);
+
+// Global error handler
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught exception:', error);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled rejection:', reason);
+  process.exit(1);
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  logger.info('Shutting down CLI...');
+  WorkflowRegistry.close();
+  process.exit(0);
+});
+
+program.parse();
+```
+
+**List Workflows Command**
+```typescript
+// apps/cli/src/commands/list.ts
+import { WorkflowRegistry } from '@workflow/database';
+import { formatTable, formatJson } from '../utils/output';
+import { Logger } from '@workflow/utils';
+
+const logger = Logger.create('cli-list');
+
+export interface ListOptions {
+  status?: 'active' | 'inactive';
+  format: 'table' | 'json';
 }
 
-export namespace ExecutionRepository {
-  export const create = async (db: Database, execution: State.Execution): Promise<Result<string>> => {
-    try {
-      const stmt = db.prepare(`
-        INSERT INTO workflow_executions (id, workflow_id, status, started_at, state)
-        VALUES (?, ?, ?, ?, ?)
-      `);
-      
-      const executionId = crypto.randomUUID();
-      stmt.run(
-        executionId,
-        execution.workflowId,
-        execution.status,
-        execution.startedAt.toISOString(),
-        JSON.stringify(execution)
-      );
-      
-      return { success: true, data: executionId };
-    } catch (error) {
-      return { 
-        success: false, 
-        error: error instanceof Error ? error : new Error(String(error))
+export const listCommand = async (options: ListOptions): Promise<void> => {
+  try {
+    const result = await WorkflowRegistry.listWorkflows();
+    
+    if (!result.success) {
+      logger.error('Failed to list workflows:', result.error);
+      process.exit(1);
+    }
+
+    let workflows = result.data;
+
+    // Filter by status if specified
+    if (options.status) {
+      workflows = workflows.filter(w => w.status === options.status);
+    }
+
+    if (workflows.length === 0) {
+      console.log('No workflows found.');
+      return;
+    }
+
+    // Format output
+    if (options.format === 'json') {
+      console.log(formatJson(workflows));
+    } else {
+      console.log(formatTable(workflows, [
+        { key: 'name', label: 'Name', width: 20 },
+        { key: 'status', label: 'Status', width: 10 },
+        { key: 'executionCount', label: 'Executions', width: 12 },
+        { key: 'lastExecutionAt', label: 'Last Execution', width: 20, 
+          format: (date: Date | undefined) => date ? date.toLocaleString() : 'Never' },
+        { key: 'createdAt', label: 'Created', width: 20, 
+          format: (date: Date) => date.toLocaleString() }
+      ]));
+    }
+
+    logger.info(`Listed ${workflows.length} workflow(s)`);
+
+  } catch (error) {
+    logger.error('Error listing workflows:', error);
+    process.exit(1);
+  }
+};
+```
+
+**Create Workflow Command**
+```typescript
+// apps/cli/src/commands/create.ts
+import fs from 'fs';
+import { z } from 'zod';
+import { Workflow } from '@workflow/core';
+import { WorkflowRegistry } from '@workflow/database';
+import { Logger } from '@workflow/utils';
+
+const logger = Logger.create('cli-create');
+
+export interface CreateOptions {
+  description?: string;
+  file?: string;
+  dryRun?: boolean;
+}
+
+const WorkflowDefinitionSchema = z.object({
+  name: z.string().min(1),
+  description: z.string().optional(),
+  steps: z.array(z.object({
+    id: z.string(),
+    type: z.string(),
+    config: z.record(z.unknown()).optional().default({})
+  })),
+  retryConfig: z.object({
+    maxAttempts: z.number().int().min(1).max(10).default(3),
+    backoffMs: z.number().int().min(0).default(1000),
+    exponentialBackoff: z.boolean().default(true)
+  }).optional(),
+  panicConfig: z.object({
+    maxRestartAttempts: z.number().int().min(1).max(5).default(3),
+    restartDelayMs: z.number().int().min(1000).default(5000),
+    enableAutoRestart: z.boolean().default(true)
+  }).optional()
+});
+
+export const createCommand = async (name: string, options: CreateOptions): Promise<void> => {
+  try {
+    let workflowDef: any;
+
+    if (options.file) {
+      // Load from file
+      if (!fs.existsSync(options.file)) {
+        logger.error(`File not found: ${options.file}`);
+        process.exit(1);
+      }
+
+      const fileContent = fs.readFileSync(options.file, 'utf-8');
+      try {
+        workflowDef = JSON.parse(fileContent);
+      } catch (error) {
+        logger.error(`Invalid JSON in file: ${options.file}`);
+        process.exit(1);
+      }
+    } else {
+      // Create basic workflow
+      workflowDef = {
+        name,
+        description: options.description,
+        steps: [
+          {
+            id: 'example-step',
+            type: 'log',
+            config: { message: 'Hello from workflow!' }
+          }
+        ]
       };
     }
-  };
+
+    // Validate workflow definition
+    const validation = WorkflowDefinitionSchema.safeParse(workflowDef);
+    if (!validation.success) {
+      logger.error('Invalid workflow definition:');
+      validation.error.errors.forEach(err => {
+        console.error(`  - ${err.path.join('.')}: ${err.message}`);
+      });
+      process.exit(1);
+    }
+
+    const validatedDef = validation.data;
+
+    if (options.dryRun) {
+      console.log('Workflow definition is valid:');
+      console.log(JSON.stringify(validatedDef, null, 2));
+      return;
+    }
+
+    // Register workflow
+    const registerResult = await WorkflowRegistry.registerWorkflow(validatedDef.name);
+    if (!registerResult.success) {
+      logger.error('Failed to register workflow:', registerResult.error);
+      process.exit(1);
+    }
+
+    // Define workflow in engine
+    Workflow.define(validatedDef.name, async (ctx) => {
+      for (const step of validatedDef.steps) {
+        await ctx.step(step.id, async () => {
+          return await executeStepByType(step.type, step.config, ctx);
+        });
+      }
+    });
+
+    console.log(`✅ Created workflow: ${validatedDef.name}`);
+    console.log(`   Database: ${registerResult.data}`);
+    console.log(`   Steps: ${validatedDef.steps.length}`);
+
+    logger.info(`Created workflow: ${validatedDef.name}`);
+
+  } catch (error) {
+    logger.error('Error creating workflow:', error);
+    process.exit(1);
+  }
+};
+
+const executeStepByType = async (type: string, config: any, ctx: any): Promise<any> => {
+  switch (type) {
+    case 'log':
+      console.log(config.message || 'Step executed');
+      return { logged: true, timestamp: new Date() };
+    
+    case 'delay':
+      const ms = config.duration || 1000;
+      await new Promise(resolve => setTimeout(resolve, ms));
+      return { delayed: ms };
+    
+    case 'http':
+      const response = await fetch(config.url);
+      return { 
+        status: response.status, 
+        data: await response.text(),
+        headers: Object.fromEntries(response.headers.entries())
+      };
+    
+    default:
+      throw new Error(`Unknown step type: ${type}`);
+  }
+};
+```
+
+**Start Execution Command**
+```typescript
+// apps/cli/src/commands/start.ts
+import fs from 'fs';
+import { Workflow } from '@workflow/core';
+import { WorkflowRegistry } from '@workflow/database';
+import { Logger } from '@workflow/utils';
+
+const logger = Logger.create('cli-start');
+
+export interface StartOptions {
+  input?: string;
+  inputFile?: string;
+  executionId?: string;
+  maxRetries?: string;
+  retryDelay?: string;
+}
+
+export const startCommand = async (workflowName: string, options: StartOptions): Promise<void> => {
+  try {
+    // Check if workflow exists
+    const statsResult = await WorkflowRegistry.getWorkflowStats(workflowName);
+    if (!statsResult.success) {
+      logger.error('Failed to check workflow:', statsResult.error);
+      process.exit(1);
+    }
+
+    if (!statsResult.data) {
+      logger.error(`Workflow not found: ${workflowName}`);
+      console.log('Available workflows:');
+      const listResult = await WorkflowRegistry.listWorkflows();
+      if (listResult.success) {
+        listResult.data.forEach(w => console.log(`  - ${w.name}`));
+      }
+      process.exit(1);
+    }
+
+    // Parse input data
+    let inputData: any = {};
+    if (options.inputFile) {
+      if (!fs.existsSync(options.inputFile)) {
+        logger.error(`Input file not found: ${options.inputFile}`);
+        process.exit(1);
+      }
+      const fileContent = fs.readFileSync(options.inputFile, 'utf-8');
+      try {
+        inputData = JSON.parse(fileContent);
+      } catch (error) {
+        logger.error(`Invalid JSON in input file: ${options.inputFile}`);
+        process.exit(1);
+      }
+    } else if (options.input) {
+      try {
+        inputData = JSON.parse(options.input);
+      } catch (error) {
+        logger.error('Invalid JSON in input parameter');
+        process.exit(1);
+      }
+    }
+
+    // Generate execution ID if not provided
+    const executionId = options.executionId || crypto.randomUUID();
+
+    // Parse retry configuration
+    const retryConfig = {
+      maxAttempts: parseInt(options.maxRetries || '3'),
+      backoffMs: parseInt(options.retryDelay || '1000'),
+      exponentialBackoff: true
+    };
+
+    console.log(`🚀 Starting workflow: ${workflowName}`);
+    console.log(`   Execution ID: ${executionId}`);
+    console.log(`   Input: ${JSON.stringify(inputData)}`);
+    console.log(`   Max retries: ${retryConfig.maxAttempts}`);
+
+    // Start execution
+    const startTime = Date.now();
+    const result = await Workflow.start(workflowName, executionId, inputData, retryConfig);
+    const duration = Date.now() - startTime;
+
+    console.log(`\n✅ Workflow completed in ${duration}ms`);
+    console.log(`   Status: ${result.status}`);
+    console.log(`   Steps completed: ${Object.keys(result.steps).length}`);
+    
+    if (result.error) {
+      console.log(`   Error: ${result.error.message}`);
+    }
+
+    // Show step details
+    console.log('\nStep Details:');
+    for (const [stepId, step] of Object.entries(result.steps)) {
+      const status = step.status === 'completed' ? '✅' : 
+                    step.status === 'failed' ? '❌' : 
+                    step.status === 'running' ? '🔄' : '⏸️';
+      
+      console.log(`  ${status} ${stepId}: ${step.status}`);
+      if (step.error) {
+        console.log(`      Error: ${step.error.message}`);
+      }
+    }
+
+    logger.info(`Workflow execution completed: ${workflowName} -> ${executionId}`);
+
+  } catch (error) {
+    logger.error('Error starting workflow:', error);
+    console.log(`\n❌ Workflow failed: ${error instanceof Error ? error.message : error}`);
+    process.exit(1);
+  }
+};
+```
+
+**Status Command**
+```typescript
+// apps/cli/src/commands/status.ts
+import { Workflow } from '@workflow/core';
+import { WorkflowDatabase, WorkflowRegistry } from '@workflow/database';
+import { formatTable, formatJson } from '../utils/output';
+import { Logger } from '@workflow/utils';
+
+const logger = Logger.create('cli-status');
+
+export interface StatusOptions {
+  workflow?: string;
+  format: 'table' | 'json';
+  follow?: boolean;
+}
+
+export const statusCommand = async (executionId?: string, options: StatusOptions = { format: 'table' }): Promise<void> => {
+  try {
+    if (executionId) {
+      // Show specific execution status
+      await showExecutionStatus(executionId, options);
+    } else if (options.workflow) {
+      // Show all executions for a workflow
+      await showWorkflowExecutions(options.workflow, options);
+    } else {
+      // Show overview of all workflows
+      await showWorkflowsOverview(options);
+    }
+
+  } catch (error) {
+    logger.error('Error getting status:', error);
+    process.exit(1);
+  }
+};
+
+const showExecutionStatus = async (executionId: string, options: StatusOptions): Promise<void> => {
+  // Find which workflow contains this execution
+  const workflowsResult = await WorkflowRegistry.listWorkflows();
+  if (!workflowsResult.success) {
+    throw workflowsResult.error;
+  }
+
+  let execution = null;
+  let workflowName = '';
+
+  for (const workflow of workflowsResult.data) {
+    const execResult = await WorkflowDatabase.loadExecution(workflow.name, executionId);
+    if (execResult.success && execResult.data) {
+      execution = execResult.data;
+      workflowName = workflow.name;
+      break;
+    }
+  }
+
+  if (!execution) {
+    console.log(`Execution not found: ${executionId}`);
+    return;
+  }
+
+  if (options.format === 'json') {
+    console.log(formatJson(execution));
+    return;
+  }
+
+  // Table format
+  console.log(`\nExecution: ${executionId}`);
+  console.log(`Workflow: ${workflowName}`);
+  console.log(`Status: ${execution.status}`);
+  console.log(`Started: ${execution.startedAt.toLocaleString()}`);
+  if (execution.completedAt) {
+    console.log(`Completed: ${execution.completedAt.toLocaleString()}`);
+    const duration = execution.completedAt.getTime() - execution.startedAt.getTime();
+    console.log(`Duration: ${duration}ms`);
+  }
+  console.log(`Restart Attempt: ${execution.restartAttempt}`);
+
+  if (execution.error) {
+    console.log(`Error: ${execution.error.message}`);
+  }
+
+  // Steps table
+  const steps = Object.entries(execution.steps).map(([stepId, step]) => ({
+    stepId,
+    status: step.status,
+    startedAt: step.startedAt.toLocaleString(),
+    completedAt: step.completedAt?.toLocaleString() || '-',
+    error: step.error?.message || '-'
+  }));
+
+  console.log('\nSteps:');
+  console.log(formatTable(steps, [
+    { key: 'stepId', label: 'Step ID', width: 20 },
+    { key: 'status', label: 'Status', width: 12 },
+    { key: 'startedAt', label: 'Started', width: 20 },
+    { key: 'completedAt', label: 'Completed', width: 20 },
+    { key: 'error', label: 'Error', width: 30 }
+  ]));
+
+  // Follow mode
+  if (options.follow && (execution.status === 'running' || execution.status === 'sleeping')) {
+    console.log('\nFollowing execution progress...');
+    await followExecution(workflowName, executionId);
+  }
+};
+
+const showWorkflowExecutions = async (workflowName: string, options: StatusOptions): Promise<void> => {
+  const execsResult = await WorkflowDatabase.listExecutions(workflowName, { limit: 20 });
+  if (!execsResult.success) {
+    throw execsResult.error;
+  }
+
+  const executions = execsResult.data;
+
+  if (executions.length === 0) {
+    console.log(`No executions found for workflow: ${workflowName}`);
+    return;
+  }
+
+  if (options.format === 'json') {
+    console.log(formatJson(executions));
+    return;
+  }
+
+  console.log(`\nExecutions for workflow: ${workflowName}`);
   
-  export const update = async (db: Database, id: string, state: State.Execution): Promise<Result<void>> => {
-    try {
-      const stmt = db.prepare(`
-        UPDATE workflow_executions 
-        SET status = ?, completed_at = ?, state = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `);
-      
-      stmt.run(
-        state.status,
-        state.completedAt?.toISOString() || null,
-        JSON.stringify(state),
-        id
-      );
-      
-      return { success: true, data: undefined };
-    } catch (error) {
-      return { 
-        success: false, 
-        error: error instanceof Error ? error : new Error(String(error))
-      };
-    }
-  };
+  const execData = executions.map(exec => ({
+    executionId: exec.executionId.substring(0, 8) + '...',
+    status: exec.status,
+    startedAt: exec.startedAt.toLocaleString(),
+    completedAt: exec.completedAt?.toLocaleString() || '-',
+    restartAttempt: exec.restartAttempt,
+    steps: Object.keys(exec.steps).length
+  }));
+
+  console.log(formatTable(execData, [
+    { key: 'executionId', label: 'Execution ID', width: 12 },
+    { key: 'status', label: 'Status', width: 12 },
+    { key: 'startedAt', label: 'Started', width: 20 },
+    { key: 'completedAt', label: 'Completed', width: 20 },
+    { key: 'restartAttempt', label: 'Restarts', width: 10 },
+    { key: 'steps', label: 'Steps', width: 8 }
+  ]));
+};
+
+const showWorkflowsOverview = async (options: StatusOptions): Promise<void> => {
+  const workflowsResult = await WorkflowRegistry.listWorkflows();
+  if (!workflowsResult.success) {
+    throw workflowsResult.error;
+  }
+
+  const workflows = workflowsResult.data;
+
+  if (workflows.length === 0) {
+    console.log('No workflows found.');
+    return;
+  }
+
+  if (options.format === 'json') {
+    console.log(formatJson(workflows));
+    return;
+  }
+
+  console.log('\nWorkflows Overview:');
+  console.log(formatTable(workflows, [
+    { key: 'name', label: 'Name', width: 20 },
+    { key: 'status', label: 'Status', width: 10 },
+    { key: 'executionCount', label: 'Executions', width: 12 },
+    { key: 'lastExecutionAt', label: 'Last Execution', width: 20, 
+      format: (date: Date | undefined) => date ? date.toLocaleString() : 'Never' }
+  ]));
+};
+
+const followExecution = async (workflowName: string, executionId: string): Promise<void> => {
+  const pollInterval = 2000; // 2 seconds
   
-  export const findByWorkflowId = async (db: Database, workflowId: string): Promise<Result<State.Execution[]>> => {
-    try {
-      const stmt = db.prepare("SELECT * FROM workflow_executions WHERE workflow_id = ? ORDER BY started_at DESC");
-      const rows = stmt.all(workflowId) as any[];
-      
-      const executions: State.Execution[] = rows.map(row => JSON.parse(row.state));
-      
-      return { success: true, data: executions };
-    } catch (error) {
-      return { 
-        success: false, 
-        error: error instanceof Error ? error : new Error(String(error))
-      };
+  while (true) {
+    await new Promise(resolve => setTimeout(resolve, pollInterval));
+    
+    const execResult = await WorkflowDatabase.loadExecution(workflowName, executionId);
+    if (!execResult.success || !execResult.data) {
+      console.log('Execution no longer found');
+      break;
     }
-  };
+
+    const execution = execResult.data;
+    
+    if (execution.status === 'completed' || execution.status === 'failed') {
+      console.log(`\n✅ Execution ${execution.status}: ${executionId}`);
+      break;
+    }
+
+    // Show current status
+    process.stdout.write(`\r🔄 Status: ${execution.status} | Steps: ${Object.keys(execution.steps).length}`);
+  }
+};
+```
+
+**CLI Output Utilities**
+```typescript
+// apps/cli/src/utils/output.ts
+export interface TableColumn {
+  key: string;
+  label: string;
+  width: number;
+  format?: (value: any) => string;
+}
+
+export const formatTable = (data: any[], columns: TableColumn[]): string => {
+  if (data.length === 0) {
+    return 'No data to display';
+  }
+
+  const lines: string[] = [];
+  
+  // Header
+  const header = columns.map(col => col.label.padEnd(col.width)).join(' | ');
+  lines.push(header);
+  lines.push(columns.map(col => '-'.repeat(col.width)).join('-+-'));
+  
+  // Rows
+  for (const row of data) {
+    const line = columns.map(col => {
+      let value = row[col.key];
+      if (col.format && value !== undefined) {
+        value = col.format(value);
+      }
+      return String(value || '').padEnd(col.width);
+    }).join(' | ');
+    lines.push(line);
+  }
+  
+  return lines.join('\n');
+};
+
+export const formatJson = (data: any): string => {
+  return JSON.stringify(data, null, 2);
+};
+```
+
+**CLI Configuration**
+```typescript
+// apps/cli/src/utils/config.ts
+import path from 'path';
+import os from 'os';
+
+export const CLIConfig = {
+  workflowsDir: process.env.WORKFLOW_DIR || path.join(os.homedir(), '.workflows'),
+  registryDbPath: process.env.WORKFLOW_REGISTRY_DB || undefined, // Will use default in workflowsDir
+  logLevel: (process.env.LOG_LEVEL as any) || 'info'
+};
+```
+
+**CLI Package Configuration**
+```json
+// apps/cli/package.json
+{
+  "name": "workflow-cli",
+  "version": "1.0.0",
+  "description": "Command-line interface for workflow management",
+  "main": "dist/index.js",
+  "bin": {
+    "workflow": "./dist/index.js"
+  },
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "build": "bun build src/index.ts --outdir dist --target node --format esm",
+    "start": "bun dist/index.js",
+    "test": "bun test",
+    "typecheck": "bun tsc --noEmit"
+  },
+  "dependencies": {
+    "@workflow/core": "workspace:*",
+    "@workflow/database": "workspace:*",
+    "@workflow/types": "workspace:*",
+    "@workflow/utils": "workspace:*",
+    "commander": "^11.0.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
 }
 ```
 
@@ -2119,86 +2683,578 @@ export interface ValidationResult {
 }
 ```
 
-### 5. Database Schema (@workflow/database)
+### 5. Per-Workflow Database Schema (@workflow/database)
 
-**SQLite Tables**
+The database package now manages separate SQLite databases for each workflow, providing isolation and better organization of workflow data.
+
+**Workflow Registry for Discovery**
+```typescript
+// packages/database/src/registry.ts
+import { Database } from "bun:sqlite";
+import path from "path";
+import fs from "fs";
+import { Logger } from '@workflow/utils';
+import type { Result } from '@workflow/types';
+
+const logger = Logger.create('workflow-registry');
+
+export namespace WorkflowRegistry {
+  export interface WorkflowInfo {
+    name: string;
+    dbPath: string;
+    createdAt: Date;
+    lastExecutionAt?: Date;
+    executionCount: number;
+    status: 'active' | 'inactive';
+  }
+
+  export interface RegistryConfig {
+    baseDir: string;
+    registryDbPath?: string;
+  }
+
+  let registryDb: Database | null = null;
+  let config: RegistryConfig;
+
+  export const initialize = (registryConfig: RegistryConfig): void => {
+    config = registryConfig;
+    
+    // Ensure base directory exists
+    if (!fs.existsSync(config.baseDir)) {
+      fs.mkdirSync(config.baseDir, { recursive: true });
+    }
+
+    // Initialize registry database
+    const registryPath = config.registryDbPath || path.join(config.baseDir, 'registry.db');
+    registryDb = new Database(registryPath);
+    
+    // Create registry table
+    registryDb.exec(`
+      CREATE TABLE IF NOT EXISTS workflow_registry (
+        name TEXT PRIMARY KEY,
+        db_path TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        last_execution_at DATETIME,
+        execution_count INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'active'
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_workflow_status ON workflow_registry(status);
+      CREATE INDEX IF NOT EXISTS idx_workflow_last_execution ON workflow_registry(last_execution_at);
+    `);
+
+    logger.info(`Workflow registry initialized at: ${registryPath}`);
+  };
+
+  export const registerWorkflow = async (workflowName: string): Promise<Result<string>> => {
+    if (!registryDb) {
+      return { success: false, error: new Error('Registry not initialized') };
+    }
+
+    try {
+      const dbPath = path.join(config.baseDir, `${workflowName}.db`);
+      
+      const stmt = registryDb.prepare(`
+        INSERT OR REPLACE INTO workflow_registry (name, db_path, created_at, status)
+        VALUES (?, ?, CURRENT_TIMESTAMP, 'active')
+      `);
+      
+      stmt.run(workflowName, dbPath);
+      
+      logger.info(`Registered workflow: ${workflowName} -> ${dbPath}`);
+      return { success: true, data: dbPath };
+      
+    } catch (error) {
+      return { 
+        success: false, 
+        error: error instanceof Error ? error : new Error(String(error))
+      };
+    }
+  };
+
+  export const getWorkflowDbPath = async (workflowName: string): Promise<Result<string | null>> => {
+    if (!registryDb) {
+      return { success: false, error: new Error('Registry not initialized') };
+    }
+
+    try {
+      const stmt = registryDb.prepare('SELECT db_path FROM workflow_registry WHERE name = ?');
+      const row = stmt.get(workflowName) as any;
+      
+      if (!row) {
+        return { success: true, data: null };
+      }
+      
+      return { success: true, data: row.db_path };
+      
+    } catch (error) {
+      return { 
+        success: false, 
+        error: error instanceof Error ? error : new Error(String(error))
+      };
+    }
+  };
+
+  export const listWorkflows = async (): Promise<Result<WorkflowInfo[]>> => {
+    if (!registryDb) {
+      return { success: false, error: new Error('Registry not initialized') };
+    }
+
+    try {
+      const stmt = registryDb.prepare(`
+        SELECT name, db_path, created_at, last_execution_at, execution_count, status
+        FROM workflow_registry
+        ORDER BY last_execution_at DESC, created_at DESC
+      `);
+      
+      const rows = stmt.all() as any[];
+      
+      const workflows: WorkflowInfo[] = rows.map(row => ({
+        name: row.name,
+        dbPath: row.db_path,
+        createdAt: new Date(row.created_at),
+        lastExecutionAt: row.last_execution_at ? new Date(row.last_execution_at) : undefined,
+        executionCount: row.execution_count,
+        status: row.status
+      }));
+      
+      return { success: true, data: workflows };
+      
+    } catch (error) {
+      return { 
+        success: false, 
+        error: error instanceof Error ? error : new Error(String(error))
+      };
+    }
+  };
+
+  export const updateExecutionStats = async (workflowName: string): Promise<Result<void>> => {
+    if (!registryDb) {
+      return { success: false, error: new Error('Registry not initialized') };
+    }
+
+    try {
+      const stmt = registryDb.prepare(`
+        UPDATE workflow_registry 
+        SET last_execution_at = CURRENT_TIMESTAMP, 
+            execution_count = execution_count + 1
+        WHERE name = ?
+      `);
+      
+      stmt.run(workflowName);
+      return { success: true, data: undefined };
+      
+    } catch (error) {
+      return { 
+        success: false, 
+        error: error instanceof Error ? error : new Error(String(error))
+      };
+    }
+  };
+
+  export const removeWorkflow = async (workflowName: string): Promise<Result<boolean>> => {
+    if (!registryDb) {
+      return { success: false, error: new Error('Registry not initialized') };
+    }
+
+    try {
+      // Get database path before deletion
+      const pathResult = await getWorkflowDbPath(workflowName);
+      if (!pathResult.success) {
+        return pathResult as Result<boolean>;
+      }
+
+      if (!pathResult.data) {
+        return { success: true, data: false }; // Workflow not found
+      }
+
+      // Remove from registry
+      const stmt = registryDb.prepare('DELETE FROM workflow_registry WHERE name = ?');
+      const result = stmt.run(workflowName);
+      
+      // Delete database file if it exists
+      if (fs.existsSync(pathResult.data)) {
+        fs.unlinkSync(pathResult.data);
+        logger.info(`Deleted workflow database: ${pathResult.data}`);
+      }
+      
+      logger.info(`Removed workflow from registry: ${workflowName}`);
+      return { success: true, data: result.changes > 0 };
+      
+    } catch (error) {
+      return { 
+        success: false, 
+        error: error instanceof Error ? error : new Error(String(error))
+      };
+    }
+  };
+
+  export const getWorkflowStats = async (workflowName: string): Promise<Result<WorkflowInfo | null>> => {
+    if (!registryDb) {
+      return { success: false, error: new Error('Registry not initialized') };
+    }
+
+    try {
+      const stmt = registryDb.prepare(`
+        SELECT name, db_path, created_at, last_execution_at, execution_count, status
+        FROM workflow_registry 
+        WHERE name = ?
+      `);
+      
+      const row = stmt.get(workflowName) as any;
+      
+      if (!row) {
+        return { success: true, data: null };
+      }
+      
+      const workflowInfo: WorkflowInfo = {
+        name: row.name,
+        dbPath: row.db_path,
+        createdAt: new Date(row.created_at),
+        lastExecutionAt: row.last_execution_at ? new Date(row.last_execution_at) : undefined,
+        executionCount: row.execution_count,
+        status: row.status
+      };
+      
+      return { success: true, data: workflowInfo };
+      
+    } catch (error) {
+      return { 
+        success: false, 
+        error: error instanceof Error ? error : new Error(String(error))
+      };
+    }
+  };
+
+  export const close = (): void => {
+    if (registryDb) {
+      registryDb.close();
+      registryDb = null;
+      logger.info('Workflow registry closed');
+    }
+  };
+}
+```
+
+**Per-Workflow Database Management**
+```typescript
+// packages/database/src/workflow-db.ts
+import { Database } from "bun:sqlite";
+import { WorkflowRegistry } from "./registry";
+import { Schema } from "./schema";
+import { Logger } from '@workflow/utils';
+import type { Result, ExecutionResult, StepResult } from '@workflow/types';
+
+const logger = Logger.create('workflow-db');
+
+export namespace WorkflowDatabase {
+  const connections = new Map<string, Database>();
+
+  export const getConnection = async (workflowName: string): Promise<Result<Database>> => {
+    try {
+      // Check if connection already exists
+      if (connections.has(workflowName)) {
+        return { success: true, data: connections.get(workflowName)! };
+      }
+
+      // Get database path from registry
+      const pathResult = await WorkflowRegistry.getWorkflowDbPath(workflowName);
+      if (!pathResult.success) {
+        return pathResult as Result<Database>;
+      }
+
+      if (!pathResult.data) {
+        // Register new workflow
+        const registerResult = await WorkflowRegistry.registerWorkflow(workflowName);
+        if (!registerResult.success) {
+          return registerResult as Result<Database>;
+        }
+        pathResult.data = registerResult.data;
+      }
+
+      // Create database connection
+      const db = new Database(pathResult.data);
+      
+      // Enable foreign keys and WAL mode for better performance
+      db.exec("PRAGMA foreign_keys = ON");
+      db.exec("PRAGMA journal_mode = WAL");
+      db.exec("PRAGMA synchronous = NORMAL");
+      
+      // Create tables
+      Schema.createWorkflowTables(db);
+      
+      // Cache connection
+      connections.set(workflowName, db);
+      
+      logger.info(`Connected to workflow database: ${workflowName} -> ${pathResult.data}`);
+      return { success: true, data: db };
+      
+    } catch (error) {
+      return { 
+        success: false, 
+        error: error instanceof Error ? error : new Error(String(error))
+      };
+    }
+  };
+
+  export const closeConnection = (workflowName: string): void => {
+    const db = connections.get(workflowName);
+    if (db) {
+      db.close();
+      connections.delete(workflowName);
+      logger.info(`Closed workflow database connection: ${workflowName}`);
+    }
+  };
+
+  export const closeAllConnections = (): void => {
+    for (const [workflowName, db] of connections) {
+      db.close();
+      logger.info(`Closed workflow database connection: ${workflowName}`);
+    }
+    connections.clear();
+  };
+
+  // Execution management
+  export const saveExecution = async (
+    workflowName: string, 
+    execution: ExecutionResult
+  ): Promise<Result<void>> => {
+    const dbResult = await getConnection(workflowName);
+    if (!dbResult.success) {
+      return dbResult as Result<void>;
+    }
+
+    try {
+      const db = dbResult.data;
+      
+      const stmt = db.prepare(`
+        INSERT OR REPLACE INTO executions (
+          id, status, started_at, completed_at, restart_attempt, error_message, input_data
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+      
+      stmt.run(
+        execution.executionId,
+        execution.status,
+        execution.startedAt.toISOString(),
+        execution.completedAt?.toISOString() || null,
+        execution.restartAttempt,
+        execution.error?.message || null,
+        JSON.stringify(execution.input || {})
+      );
+
+      // Save steps
+      for (const [stepId, step] of Object.entries(execution.steps)) {
+        await saveStep(db, execution.executionId, stepId, step);
+      }
+
+      // Update registry stats
+      await WorkflowRegistry.updateExecutionStats(workflowName);
+      
+      return { success: true, data: undefined };
+      
+    } catch (error) {
+      return { 
+        success: false, 
+        error: error instanceof Error ? error : new Error(String(error))
+      };
+    }
+  };
+
+  export const loadExecution = async (
+    workflowName: string, 
+    executionId: string
+  ): Promise<Result<ExecutionResult | null>> => {
+    const dbResult = await getConnection(workflowName);
+    if (!dbResult.success) {
+      return dbResult as Result<ExecutionResult | null>;
+    }
+
+    try {
+      const db = dbResult.data;
+      
+      // Load execution
+      const execStmt = db.prepare('SELECT * FROM executions WHERE id = ?');
+      const execRow = execStmt.get(executionId) as any;
+      
+      if (!execRow) {
+        return { success: true, data: null };
+      }
+
+      // Load steps
+      const stepsStmt = db.prepare('SELECT * FROM steps WHERE execution_id = ?');
+      const stepRows = stepsStmt.all(executionId) as any[];
+      
+      const steps: Record<string, StepResult> = {};
+      for (const stepRow of stepRows) {
+        steps[stepRow.step_id] = {
+          stepId: stepRow.step_id,
+          status: stepRow.status,
+          result: stepRow.result_data ? JSON.parse(stepRow.result_data) : undefined,
+          error: stepRow.error_message ? new Error(stepRow.error_message) : undefined,
+          startedAt: new Date(stepRow.started_at),
+          completedAt: stepRow.completed_at ? new Date(stepRow.completed_at) : undefined
+        };
+      }
+
+      const execution: ExecutionResult = {
+        executionId: execRow.id,
+        status: execRow.status,
+        startedAt: new Date(execRow.started_at),
+        completedAt: execRow.completed_at ? new Date(execRow.completed_at) : undefined,
+        error: execRow.error_message ? new Error(execRow.error_message) : undefined,
+        steps,
+        restartAttempt: execRow.restart_attempt
+      };
+      
+      return { success: true, data: execution };
+      
+    } catch (error) {
+      return { 
+        success: false, 
+        error: error instanceof Error ? error : new Error(String(error))
+      };
+    }
+  };
+
+  export const listExecutions = async (
+    workflowName: string,
+    options: {
+      status?: string;
+      limit?: number;
+      offset?: number;
+    } = {}
+  ): Promise<Result<ExecutionResult[]>> => {
+    const dbResult = await getConnection(workflowName);
+    if (!dbResult.success) {
+      return dbResult as Result<ExecutionResult[]>;
+    }
+
+    try {
+      const db = dbResult.data;
+      
+      let query = 'SELECT * FROM executions';
+      const params: any[] = [];
+      
+      if (options.status) {
+        query += ' WHERE status = ?';
+        params.push(options.status);
+      }
+      
+      query += ' ORDER BY started_at DESC';
+      
+      if (options.limit) {
+        query += ' LIMIT ?';
+        params.push(options.limit);
+        
+        if (options.offset) {
+          query += ' OFFSET ?';
+          params.push(options.offset);
+        }
+      }
+
+      const stmt = db.prepare(query);
+      const rows = stmt.all(...params) as any[];
+      
+      const executions: ExecutionResult[] = [];
+      
+      for (const row of rows) {
+        const execution = await loadExecution(workflowName, row.id);
+        if (execution.success && execution.data) {
+          executions.push(execution.data);
+        }
+      }
+      
+      return { success: true, data: executions };
+      
+    } catch (error) {
+      return { 
+        success: false, 
+        error: error instanceof Error ? error : new Error(String(error))
+      };
+    }
+  };
+
+  const saveStep = async (
+    db: Database,
+    executionId: string,
+    stepId: string,
+    step: StepResult
+  ): Promise<void> => {
+    const stmt = db.prepare(`
+      INSERT OR REPLACE INTO steps (
+        execution_id, step_id, status, started_at, completed_at, 
+        result_data, error_message
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    
+    stmt.run(
+      executionId,
+      stepId,
+      step.status,
+      step.startedAt.toISOString(),
+      step.completedAt?.toISOString() || null,
+      step.result ? JSON.stringify(step.result) : null,
+      step.error?.message || null
+    );
+  };
+}
+```
+
+**Updated Database Schema**
 ```typescript
 // packages/database/src/schema.ts
 import { Database } from "bun:sqlite";
 
 export namespace Schema {
-  export const createTables = (db: Database): void => {
+  export const createWorkflowTables = (db: Database): void => {
     db.exec(`
-      CREATE TABLE IF NOT EXISTS workflows (
+      CREATE TABLE IF NOT EXISTS executions (
         id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        definition TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        completed_at DATETIME,
+        restart_attempt INTEGER DEFAULT 1,
+        error_message TEXT,
+        input_data TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
 
-      CREATE TABLE IF NOT EXISTS workflow_executions (
-        id TEXT PRIMARY KEY,
-        workflow_id TEXT NOT NULL,
-        status TEXT NOT NULL,
-        started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        completed_at DATETIME,
-        error_message TEXT,
-        state TEXT NOT NULL,
-        FOREIGN KEY (workflow_id) REFERENCES workflows (id)
-      );
-
-      CREATE TABLE IF NOT EXISTS step_executions (
-        id TEXT PRIMARY KEY,
+      CREATE TABLE IF NOT EXISTS steps (
         execution_id TEXT NOT NULL,
         step_id TEXT NOT NULL,
         status TEXT NOT NULL,
         started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         completed_at DATETIME,
-        input TEXT,
-        output TEXT,
+        result_data TEXT,
         error_message TEXT,
-        FOREIGN KEY (execution_id) REFERENCES workflow_executions (id)
+        attempt INTEGER DEFAULT 1,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (execution_id, step_id),
+        FOREIGN KEY (execution_id) REFERENCES executions (id) ON DELETE CASCADE
       );
+
+      CREATE INDEX IF NOT EXISTS idx_executions_status ON executions(status);
+      CREATE INDEX IF NOT EXISTS idx_executions_started_at ON executions(started_at);
+      CREATE INDEX IF NOT EXISTS idx_steps_status ON steps(status);
+      CREATE INDEX IF NOT EXISTS idx_steps_execution_id ON steps(execution_id);
+      
+      -- Trigger to update updated_at timestamp
+      CREATE TRIGGER IF NOT EXISTS update_executions_timestamp 
+        AFTER UPDATE ON executions
+      BEGIN
+        UPDATE executions SET updated_at = CURRENT_TIMESTAMP WHERE id = NEW.id;
+      END;
+      
+      CREATE TRIGGER IF NOT EXISTS update_steps_timestamp 
+        AFTER UPDATE ON steps
+      BEGIN
+        UPDATE steps SET updated_at = CURRENT_TIMESTAMP 
+        WHERE execution_id = NEW.execution_id AND step_id = NEW.step_id;
+      END;
     `);
-  };
-}
-
-// packages/database/src/connection.ts
-import { Database } from "bun:sqlite";
-import { Schema } from "./schema";
-
-export namespace DatabaseConnection {
-  let db: Database | null = null;
-  
-  export const initialize = (path: string = "./workflow.db"): Database => {
-    if (db) {
-      return db;
-    }
-    
-    db = new Database(path);
-    
-    // Enable foreign keys
-    db.exec("PRAGMA foreign_keys = ON");
-    
-    // Create tables
-    Schema.createTables(db);
-    
-    return db;
-  };
-  
-  export const getConnection = (): Database => {
-    if (!db) {
-      throw new Error("Database not initialized. Call initialize() first.");
-    }
-    return db;
-  };
-  
-  export const close = (): void => {
-    if (db) {
-      db.close();
-      db = null;
-    }
   };
 }
 ```
@@ -3044,47 +4100,324 @@ Workflow.define("smart-retry", async (ctx) => {
 });
 ```
 
-### 3. Graceful Degradation with Validation
-```typescript
-import { z } from 'zod';
+## Usage Examples
 
-const UserSchema = z.object({
-  id: z.string().uuid(),
-  name: z.string(),
-  email: z.string().email(),
-  lastActive: z.date()
+### CLI Usage Examples
+
+**List all workflows**
+```bash
+# List workflows in table format
+workflow list
+
+# List workflows in JSON format
+workflow list --format json
+
+# List only active workflows
+workflow list --status active
+```
+
+**Create a new workflow**
+```bash
+# Create a simple workflow
+workflow create my-workflow --description "My first workflow"
+
+# Create workflow from file
+workflow create data-pipeline --file ./workflows/data-pipeline.json
+
+# Validate workflow definition without creating
+workflow create test-workflow --file ./test.json --dry-run
+```
+
+**Start workflow execution**
+```bash
+# Start workflow with default settings
+workflow start my-workflow
+
+# Start with custom input data
+workflow start data-pipeline --input '{"source": "database", "target": "s3"}'
+
+# Start with input from file
+workflow start data-pipeline --input-file ./input.json
+
+# Start with custom retry settings
+workflow start my-workflow --max-retries 5 --retry-delay 2000
+```
+
+**Check execution status**
+```bash
+# Show overview of all workflows
+workflow status
+
+# Show executions for specific workflow
+workflow status --workflow my-workflow
+
+# Show specific execution details
+workflow status abc123def-456-789
+
+# Follow execution progress in real-time
+workflow status abc123def-456-789 --follow
+```
+
+**Cleanup old executions**
+```bash
+# Show what would be cleaned up (dry run)
+workflow cleanup --older-than 7 --dry-run
+
+# Remove executions older than 30 days
+workflow cleanup --older-than 30
+
+# Remove only failed executions
+workflow cleanup --status failed --older-than 7
+```
+
+### Workflow Definition File Examples
+
+**Simple Log Workflow**
+```json
+// workflows/simple-log.json
+{
+  "name": "simple-log",
+  "description": "A simple workflow that logs messages",
+  "steps": [
+    {
+      "id": "welcome",
+      "type": "log",
+      "config": {
+        "message": "Welcome to the workflow!"
+      }
+    },
+    {
+      "id": "wait",
+      "type": "delay",
+      "config": {
+        "duration": 2000
+      }
+    },
+    {
+      "id": "goodbye",
+      "type": "log",
+      "config": {
+        "message": "Workflow completed successfully!"
+      }
+    }
+  ],
+  "retryConfig": {
+    "maxAttempts": 3,
+    "backoffMs": 1000,
+    "exponentialBackoff": true
+  }
+}
+```
+
+**HTTP API Workflow**
+```json
+// workflows/api-workflow.json
+{
+  "name": "api-workflow",
+  "description": "Workflow that calls external APIs",
+  "steps": [
+    {
+      "id": "fetch-users",
+      "type": "http",
+      "config": {
+        "url": "https://jsonplaceholder.typicode.com/users"
+      }
+    },
+    {
+      "id": "process-delay",
+      "type": "delay",
+      "config": {
+        "duration": 1000
+      }
+    },
+    {
+      "id": "fetch-posts",
+      "type": "http",
+      "config": {
+        "url": "https://jsonplaceholder.typicode.com/posts"
+      }
+    },
+    {
+      "id": "completion-log",
+      "type": "log",
+      "config": {
+        "message": "API data fetched successfully"
+      }
+    }
+  ],
+  "retryConfig": {
+    "maxAttempts": 5,
+    "backoffMs": 2000,
+    "exponentialBackoff": true
+  },
+  "panicConfig": {
+    "maxRestartAttempts": 2,
+    "restartDelayMs": 10000,
+    "enableAutoRestart": true
+  }
+}
+```
+
+### Programmatic Usage Examples
+
+**Basic Workflow Definition**
+```typescript
+import { Workflow } from '@workflow/core';
+import { WorkflowRegistry } from '@workflow/database';
+
+// Initialize registry
+WorkflowRegistry.initialize({
+  baseDir: './workflows-data'
 });
 
-Workflow.define("resilient-workflow", async (ctx) => {
-    let userData;
+// Define a simple workflow
+Workflow.define("data-processing", async (ctx) => {
+    const data = await ctx.step("fetch-data", async () => {
+        return { records: [1, 2, 3, 4, 5] };
+    });
     
-    try {
-        userData = await ctx.step("fetch-user", async () => {
-            const apiResponse = await getUserFromAPI(ctx.input.userId);
-            // Validate API response structure
-            return UserSchema.parse(apiResponse);
-        });
-    } catch (error) {
-        // Fallback to cached data with validation
-        userData = await ctx.step("fallback-user", async () => {
-            const cachedData = await getUserFromCache(ctx.input.userId);
-            // Validate cached data structure
-            const validation = UserSchema.safeParse(cachedData);
-            if (!validation.success) {
-                throw new ValidationError(
-                    "Both API and cache data are invalid",
-                    validation.error
-                );
-            }
-            return validation.data;
-        });
-    }
+    await ctx.step("process-data", async () => {
+        console.log(`Processing ${data.records.length} records`);
+        return { processed: data.records.length };
+    });
     
-    await ctx.step("process-user", async () => {
-        // userData is guaranteed to be valid User type
-        return processUser(userData);
+    await ctx.sleep("wait-before-cleanup", 1000);
+    
+    await ctx.step("cleanup", async () => {
+        console.log("Cleanup completed");
     });
 });
+
+// Start execution
+const result = await Workflow.start("data-processing", crypto.randomUUID());
+console.log("Workflow result:", result);
+```
+
+**Workflow with Error Handling and Retries**
+```typescript
+Workflow.define("resilient-api-call", async (ctx) => {
+    // This step will retry automatically on failure
+    const apiData = await ctx.step("api-call", async () => {
+        const response = await fetch("https://api.example.com/data");
+        if (!response.ok) {
+            throw new Error(`API returned ${response.status}`);
+        }
+        return await response.json();
+    });
+    
+    await ctx.step("validate-data", async () => {
+        if (!apiData || !apiData.id) {
+            throw new Error("Invalid data received from API");
+        }
+        return { validated: true };
+    });
+    
+    await ctx.step("save-data", async () => {
+        // Simulate database save
+        console.log("Saving data:", apiData.id);
+        return { saved: true };
+    });
+});
+
+// Start with custom retry configuration
+await Workflow.start("resilient-api-call", crypto.randomUUID(), {}, {
+    maxAttempts: 5,
+    backoffMs: 2000,
+    exponentialBackoff: true
+}, {
+    maxRestartAttempts: 3,
+    restartDelayMs: 10000,
+    enableAutoRestart: true
+});
+```
+
+**Workflow Discovery and Management**
+```typescript
+import { WorkflowRegistry, WorkflowDatabase } from '@workflow/database';
+
+// List all available workflows
+const workflowsResult = await WorkflowRegistry.listWorkflows();
+if (workflowsResult.success) {
+    console.log("Available workflows:");
+    workflowsResult.data.forEach(workflow => {
+        console.log(`- ${workflow.name}: ${workflow.executionCount} executions`);
+        console.log(`  Last run: ${workflow.lastExecutionAt?.toLocaleString() || 'Never'}`);
+        console.log(`  Status: ${workflow.status}`);
+    });
+}
+
+// Get detailed stats for a specific workflow
+const statsResult = await WorkflowRegistry.getWorkflowStats("data-processing");
+if (statsResult.success && statsResult.data) {
+    const stats = statsResult.data;
+    console.log(`Workflow: ${stats.name}`);
+    console.log(`Database: ${stats.dbPath}`);
+    console.log(`Total executions: ${stats.executionCount}`);
+    console.log(`Created: ${stats.createdAt.toLocaleString()}`);
+}
+
+// List recent executions for a workflow
+const executionsResult = await WorkflowDatabase.listExecutions("data-processing", {
+    limit: 10
+});
+if (executionsResult.success) {
+    console.log("Recent executions:");
+    executionsResult.data.forEach(exec => {
+        console.log(`- ${exec.executionId}: ${exec.status} (${exec.startedAt.toLocaleString()})`);
+    });
+}
+```
+
+### Database Structure Examples
+
+Each workflow gets its own SQLite database file:
+```
+~/.workflows/
+├── registry.db              # Central registry of all workflows
+├── data-processing.db        # Database for "data-processing" workflow
+├── api-workflow.db          # Database for "api-workflow" workflow
+├── simple-log.db            # Database for "simple-log" workflow
+└── resilient-api-call.db    # Database for "resilient-api-call" workflow
+```
+
+**Registry Database Schema:**
+```sql
+-- registry.db
+CREATE TABLE workflow_registry (
+    name TEXT PRIMARY KEY,
+    db_path TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_execution_at DATETIME,
+    execution_count INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'active'
+);
+```
+
+**Per-Workflow Database Schema:**
+```sql
+-- {workflow-name}.db
+CREATE TABLE executions (
+    id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME,
+    restart_attempt INTEGER DEFAULT 1,
+    error_message TEXT,
+    input_data TEXT
+);
+
+CREATE TABLE steps (
+    execution_id TEXT NOT NULL,
+    step_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME,
+    result_data TEXT,
+    error_message TEXT,
+    attempt INTEGER DEFAULT 1,
+    PRIMARY KEY (execution_id, step_id),
+    FOREIGN KEY (execution_id) REFERENCES executions (id) ON DELETE CASCADE
+);
 ```
 
 ## Library Commands
