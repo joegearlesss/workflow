@@ -5,6 +5,7 @@
 The workflow library is built as a standalone TypeScript package that provides:
 - **Fluent API** for defining workflows with steps, sleep, and error handling
 - **TypeScript** for type safety and development experience
+- **Zod** for runtime schema validation and type inference
 - **Bun** as the runtime and package manager
 - **Functional Programming** with namespaces (no classes)
 - **Bun SQLite** for persistent state and execution tracking
@@ -85,6 +86,7 @@ The project is organized as a single publishable library:
 - **Fluent API**: Simple, chainable workflow definition syntax
 - **Automatic Retry**: Built-in retry logic with configurable attempts
 - **Panic Recovery**: Automatic restart after system-level failures
+- **Schema Validation**: Runtime validation with Zod for type safety
 - **Resumable Execution**: Workflows can be paused and resumed
 - **State Persistence**: Reliable state storage with Bun's SQLite client
 - **Error Recovery**: Automatic error handling and recovery
@@ -95,16 +97,27 @@ The project is organized as a single publishable library:
 
 ```typescript
 import { Workflow } from '@workflow/core';
+import { z } from 'zod';
+
+// Define input schema for validation
+const EmailInputSchema = z.object({
+    email: z.string().email('Invalid email format'),
+    name: z.string().min(1, 'Name is required'),
+    templateId: z.string().uuid('Invalid template ID')
+});
 
 // Define a complex workflow with error handling and panic recovery
 Workflow.define("email-notification", async (ctx) => {
-    // Step 1: Validate input data
+    // Step 1: Validate input data with Zod
     const userData = await ctx.step("validate-input", async () => {
-        const data = ctx.input as { email: string; name: string };
-        if (!data.email || !data.name) {
-            throw new Error("Missing required fields");
+        const validation = EmailInputSchema.safeParse(ctx.input);
+        if (!validation.success) {
+            throw new ValidationError(
+                "Invalid input data",
+                validation.error
+            );
         }
-        return data;
+        return validation.data;
     });
 
     // Step 2: Wait before processing (demonstrating sleep)
@@ -123,7 +136,19 @@ Workflow.define("email-notification", async (ctx) => {
         }
         
         console.log(`Sending email to ${userData.email}`);
-        return { emailId: "email-123", status: "sent" };
+        
+        // Validate response structure
+        const responseSchema = z.object({
+            emailId: z.string().uuid(),
+            status: z.enum(['sent', 'queued', 'failed'])
+        });
+        
+        const response = { 
+            emailId: crypto.randomUUID(), 
+            status: 'sent' as const 
+        };
+        
+        return responseSchema.parse(response);
     });
 
     // Step 4: Log success
@@ -133,10 +158,11 @@ Workflow.define("email-notification", async (ctx) => {
     });
 });
 
-// Start the workflow with input data and panic recovery configuration
-await Workflow.start("email-notification", "user-signup-123", {
+// Start the workflow with validated input data and panic recovery configuration
+await Workflow.start("email-notification", crypto.randomUUID(), {
     email: "user@example.com",
-    name: "John Doe"
+    name: "John Doe",
+    templateId: crypto.randomUUID()
 }, {
     maxAttempts: 3,
     backoffMs: 1000,
@@ -154,6 +180,7 @@ await Workflow.start("email-notification", "user-signup-123", {
 - **Maintainable**: Functional programming reduces complexity
 - **Reliable**: Bun's SQLite client provides ACID transactions
 - **Resilient**: Automatic panic detection and restart capabilities
+- **Validated**: Zod schemas ensure runtime type safety and data integrity
 - **Fast**: Bun runtime offers excellent performance
 - **Type-Safe**: TypeScript prevents runtime errors
 - **Developer Friendly**: Intuitive fluent API with great IDE support

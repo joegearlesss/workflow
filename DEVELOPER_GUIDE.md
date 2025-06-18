@@ -6,6 +6,7 @@
 - Bun 1.0+ installed
 - TypeScript knowledge
 - Functional programming familiarity
+- Zod for schema validation
 
 ### Library Installation
 
@@ -57,6 +58,7 @@ mkdir -p tests/{unit,integration,e2e}
 
 # Install shared dependencies at root
 bun add -d typescript @types/node @types/bun
+bun add zod
 
 # Create root TypeScript configuration
 cat > tsconfig.json << 'EOF'
@@ -124,8 +126,32 @@ EOF
 ├── apps/                        # Development applications
 │   ├── server/                  # Development server
 │   │   ├── src/
-│   │   │   ├── index.ts
-│   │   │   └── index.test.ts    # Integration tests
+│   │   │   ├── index.ts         # Main server entry point
+│   │   │   ├── routes/          # API route handlers
+│   │   │   │   ├── workflows.ts # Workflow management endpoints
+│   │   │   │   ├── executions.ts # Execution monitoring endpoints
+│   │   │   │   └── health.ts    # Health check endpoints
+│   │   │   ├── middleware/      # Express middleware
+│   │   │   │   ├── auth.ts      # Authentication middleware
+│   │   │   │   ├── cors.ts      # CORS configuration
+│   │   │   │   └── logging.ts   # Request logging
+│   │   │   ├── services/        # Business logic services
+│   │   │   │   ├── workflow-service.ts # Workflow operations
+│   │   │   │   └── execution-service.ts # Execution management
+│   │   │   ├── config/          # Server configuration
+│   │   │   │   ├── database.ts  # Database connection config
+│   │   │   │   └── server.ts    # Server settings
+│   │   │   └── types/           # Server-specific types
+│   │   │       └── api.ts       # API request/response types
+│   │   ├── package.json         # Server dependencies
+│   │   ├── tsconfig.json        # TypeScript config
+│   │   └── tests/               # Server tests
+│   │       ├── integration/     # Integration tests
+│   │       │   ├── workflows.test.ts
+│   │       │   └── executions.test.ts
+│   │       └── unit/            # Unit tests
+│   │           ├── services.test.ts
+│   │           └── middleware.test.ts
 │   ├── cli/                     # CLI tool for testing
 │   │   ├── src/
 │   │   │   ├── index.ts
@@ -141,7 +167,790 @@ EOF
         └── integration.test.ts
 ```
 
-## Development Guidelines
+## Development Applications
+
+### Server Application (apps/server)
+
+The development server provides a REST API for workflow management and execution monitoring. It's built with Express.js and includes comprehensive error handling, authentication, and monitoring capabilities.
+
+**Main Server Entry Point**
+```typescript
+// apps/server/src/index.ts
+import express from 'express';
+import cors from 'cors';
+import { DatabaseConnection } from '@workflow/database';
+import { Logger } from '@workflow/utils';
+import { workflowRoutes } from './routes/workflows';
+import { executionRoutes } from './routes/executions';
+import { healthRoutes } from './routes/health';
+import { authMiddleware } from './middleware/auth';
+import { loggingMiddleware } from './middleware/logging';
+import { corsMiddleware } from './middleware/cors';
+import { ServerConfig } from './config/server';
+
+const app = express();
+const logger = Logger.create('server');
+
+// Initialize database
+DatabaseConnection.initialize(ServerConfig.database.path);
+
+// Middleware
+app.use(express.json());
+app.use(corsMiddleware);
+app.use(loggingMiddleware);
+
+// Routes
+app.use('/api/health', healthRoutes);
+app.use('/api/workflows', authMiddleware, workflowRoutes);
+app.use('/api/executions', authMiddleware, executionRoutes);
+
+// Error handling
+app.use((error: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  logger.error('Unhandled error:', error);
+  res.status(500).json({
+    error: 'Internal server error',
+    message: process.env.NODE_ENV === 'development' ? error.message : 'Something went wrong'
+  });
+});
+
+const port = ServerConfig.port || 3000;
+app.listen(port, () => {
+  logger.info(`Workflow server listening on port ${port}`);
+});
+
+export { app };
+```
+
+**Workflow Management Routes**
+```typescript
+// apps/server/src/routes/workflows.ts
+import { Router } from 'express';
+import { z } from 'zod';
+import { Workflow } from '@workflow/core';
+import { WorkflowService } from '../services/workflow-service';
+import { Logger } from '@workflow/utils';
+import type { CreateWorkflowRequest, WorkflowResponse } from '../types/api';
+
+const router = Router();
+const logger = Logger.create('workflows-api');
+
+// Schema validation for requests
+const CreateWorkflowSchema = z.object({
+  name: z.string().min(1, 'Workflow name is required'),
+  description: z.string().optional(),
+  definition: z.object({
+    steps: z.array(z.object({
+      id: z.string(),
+      type: z.string(),
+      config: z.record(z.unknown())
+    }))
+  }),
+  retryConfig: z.object({
+    maxAttempts: z.number().int().min(1).max(10),
+    backoffMs: z.number().int().min(0).optional(),
+    exponentialBackoff: z.boolean().optional()
+  }).optional(),
+  panicConfig: z.object({
+    maxRestartAttempts: z.number().int().min(1).max(5),
+    restartDelayMs: z.number().int().min(1000),
+    enableAutoRestart: z.boolean()
+  }).optional()
+});
+
+const StartWorkflowSchema = z.object({
+  executionId: z.string().uuid('Invalid execution ID format'),
+  input: z.record(z.unknown()).optional(),
+  retryConfig: z.object({
+    maxAttempts: z.number().int().min(1).max(10),
+    backoffMs: z.number().int().min(0).optional(),
+    exponentialBackoff: z.boolean().optional()
+  }).optional(),
+  panicConfig: z.object({
+    maxRestartAttempts: z.number().int().min(1).max(5),
+    restartDelayMs: z.number().int().min(1000),
+    enableAutoRestart: z.boolean()
+  }).optional()
+});
+
+// POST /api/workflows - Create a new workflow
+router.post('/', async (req, res) => {
+  try {
+    const validation = CreateWorkflowSchema.safeParse(req.body);
+    if (!validation.success) {
+      return res.status(400).json({
+        error: 'Invalid request data',
+        details: validation.error.errors
+      });
+    }
+
+    const { name, description, definition, retryConfig, panicConfig } = validation.data;
+    
+    // Register workflow with the engine
+    Workflow.define(name, async (ctx) => {
+      for (const step of definition.steps) {
+        await ctx.step(step.id, async () => {
+          // Execute step based on type and config
+          return await WorkflowService.executeStep(step.type, step.config, ctx);
+        });
+      }
+    });
+
+    const workflow = await WorkflowService.createWorkflow({
+      name,
+      description,
+      definition,
+      retryConfig,
+      panicConfig
+    });
+
+    logger.info(`Created workflow: ${name}`);
+    
+    res.status(201).json({
+      id: workflow.id,
+      name: workflow.name,
+      description: workflow.description,
+      createdAt: workflow.createdAt,
+      status: 'created'
+    } as WorkflowResponse);
+
+  } catch (error) {
+    logger.error('Failed to create workflow:', error);
+    res.status(500).json({
+      error: 'Failed to create workflow',
+      message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+// GET /api/workflows - List all workflows
+router.get('/', async (req, res) => {
+  try {
+    const workflows = await WorkflowService.listWorkflows();
+    
+    res.json({
+      workflows: workflows.map(w => ({
+        id: w.id,
+        name: w.name,
+        description: w.description,
+        createdAt: w.createdAt,
+        status: 'ready'
+      }))
+    });
+
+  } catch (error) {
+    logger.error('Failed to list workflows:', error);
+    res.status(500).json({
+      error: 'Failed to list workflows',
+      message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+// GET /api/workflows/:id - Get workflow details
+router.get('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const workflow = await WorkflowService.getWorkflow(id);
+    
+    if (!workflow) {
+      return res.status(404).json({
+        error: 'Workflow not found',
+        message: `No workflow found with ID: ${id}`
+      });
+    }
+
+    res.json({
+      id: workflow.id,
+      name: workflow.name,
+      description: workflow.description,
+      definition: workflow.definition,
+      createdAt: workflow.createdAt,
+      status: 'ready'
+    } as WorkflowResponse);
+
+  } catch (error) {
+    logger.error(`Failed to get workflow ${req.params.id}:`, error);
+    res.status(500).json({
+      error: 'Failed to get workflow',
+      message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+// POST /api/workflows/:id/start - Start workflow execution
+router.post('/:id/start', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const validation = StartWorkflowSchema.safeParse(req.body);
+    
+    if (!validation.success) {
+      return res.status(400).json({
+        error: 'Invalid request data',
+        details: validation.error.errors
+      });
+    }
+
+    const { executionId, input, retryConfig, panicConfig } = validation.data;
+    
+    // Start workflow execution
+    const result = await Workflow.start(id, executionId, input, retryConfig, panicConfig);
+    
+    logger.info(`Started workflow execution: ${id} -> ${executionId}`);
+    
+    res.status(202).json({
+      executionId: result.executionId,
+      status: result.status,
+      startedAt: result.startedAt,
+      message: 'Workflow execution started'
+    });
+
+  } catch (error) {
+    logger.error(`Failed to start workflow ${req.params.id}:`, error);
+    res.status(500).json({
+      error: 'Failed to start workflow',
+      message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+// DELETE /api/workflows/:id - Delete workflow
+router.delete('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const deleted = await WorkflowService.deleteWorkflow(id);
+    
+    if (!deleted) {
+      return res.status(404).json({
+        error: 'Workflow not found',
+        message: `No workflow found with ID: ${id}`
+      });
+    }
+
+    logger.info(`Deleted workflow: ${id}`);
+    
+    res.status(204).send();
+
+  } catch (error) {
+    logger.error(`Failed to delete workflow ${req.params.id}:`, error);
+    res.status(500).json({
+      error: 'Failed to delete workflow',
+      message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+export { router as workflowRoutes };
+```
+
+**Execution Monitoring Routes**
+```typescript
+// apps/server/src/routes/executions.ts
+import { Router } from 'express';
+import { z } from 'zod';
+import { Workflow } from '@workflow/core';
+import { ExecutionService } from '../services/execution-service';
+import { Logger } from '@workflow/utils';
+import type { ExecutionResponse, ExecutionListResponse } from '../types/api';
+
+const router = Router();
+const logger = Logger.create('executions-api');
+
+// GET /api/executions - List all executions
+router.get('/', async (req, res) => {
+  try {
+    const { workflowId, status, limit = 50, offset = 0 } = req.query;
+    
+    const executions = await ExecutionService.listExecutions({
+      workflowId: workflowId as string,
+      status: status as string,
+      limit: parseInt(limit as string),
+      offset: parseInt(offset as string)
+    });
+    
+    res.json({
+      executions: executions.map(e => ({
+        executionId: e.executionId,
+        workflowId: e.workflowId,
+        status: e.status,
+        startedAt: e.startedAt,
+        completedAt: e.completedAt,
+        restartAttempt: e.restartAttempt,
+        error: e.error?.message
+      })),
+      total: executions.length
+    } as ExecutionListResponse);
+
+  } catch (error) {
+    logger.error('Failed to list executions:', error);
+    res.status(500).json({
+      error: 'Failed to list executions',
+      message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+// GET /api/executions/:id - Get execution details
+router.get('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const execution = await Workflow.getStatus(id);
+    
+    res.json({
+      executionId: execution.executionId,
+      status: execution.status,
+      startedAt: execution.startedAt,
+      completedAt: execution.completedAt,
+      restartAttempt: execution.restartAttempt,
+      steps: Object.entries(execution.steps).map(([stepId, step]) => ({
+        stepId,
+        status: step.status,
+        startedAt: step.startedAt,
+        completedAt: step.completedAt,
+        result: step.result,
+        error: step.error?.message
+      })),
+      error: execution.error?.message
+    } as ExecutionResponse);
+
+  } catch (error) {
+    logger.error(`Failed to get execution ${req.params.id}:`, error);
+    res.status(500).json({
+      error: 'Failed to get execution',
+      message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+// POST /api/executions/:id/resume - Resume paused execution
+router.post('/:id/resume', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await Workflow.resume(id);
+    
+    logger.info(`Resumed execution: ${id}`);
+    
+    res.json({
+      executionId: result.executionId,
+      status: result.status,
+      message: 'Execution resumed'
+    });
+
+  } catch (error) {
+    logger.error(`Failed to resume execution ${req.params.id}:`, error);
+    res.status(500).json({
+      error: 'Failed to resume execution',
+      message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+// POST /api/executions/:id/restart - Restart failed execution
+router.post('/:id/restart', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const result = await Workflow.restart(id);
+    
+    logger.info(`Restarted execution: ${id}`);
+    
+    res.json({
+      executionId: result.executionId,
+      status: result.status,
+      restartAttempt: result.restartAttempt,
+      message: 'Execution restarted'
+    });
+
+  } catch (error) {
+    logger.error(`Failed to restart execution ${req.params.id}:`, error);
+    res.status(500).json({
+      error: 'Failed to restart execution',
+      message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+// DELETE /api/executions/:id - Cancel execution
+router.delete('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const cancelled = await ExecutionService.cancelExecution(id);
+    
+    if (!cancelled) {
+      return res.status(404).json({
+        error: 'Execution not found',
+        message: `No execution found with ID: ${id}`
+      });
+    }
+
+    logger.info(`Cancelled execution: ${id}`);
+    
+    res.status(204).send();
+
+  } catch (error) {
+    logger.error(`Failed to cancel execution ${req.params.id}:`, error);
+    res.status(500).json({
+      error: 'Failed to cancel execution',
+      message: error instanceof Error ? error.message : 'Unknown error'
+    });
+  }
+});
+
+export { router as executionRoutes };
+```
+
+**Server Configuration**
+```typescript
+// apps/server/src/config/server.ts
+import { z } from 'zod';
+
+const ServerConfigSchema = z.object({
+  port: z.number().int().min(1000).max(65535).default(3000),
+  host: z.string().default('localhost'),
+  database: z.object({
+    path: z.string().default('./workflow.db')
+  }),
+  auth: z.object({
+    enabled: z.boolean().default(false),
+    secret: z.string().optional(),
+    tokenExpiry: z.string().default('24h')
+  }),
+  cors: z.object({
+    origin: z.union([z.string(), z.array(z.string())]).default('*'),
+    credentials: z.boolean().default(true)
+  }),
+  logging: z.object({
+    level: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+    format: z.enum(['json', 'text']).default('text')
+  })
+});
+
+export const ServerConfig = ServerConfigSchema.parse({
+  port: parseInt(process.env.PORT || '3000'),
+  host: process.env.HOST || 'localhost',
+  database: {
+    path: process.env.DATABASE_PATH || './workflow.db'
+  },
+  auth: {
+    enabled: process.env.AUTH_ENABLED === 'true',
+    secret: process.env.JWT_SECRET,
+    tokenExpiry: process.env.TOKEN_EXPIRY || '24h'
+  },
+  cors: {
+    origin: process.env.CORS_ORIGIN || '*',
+    credentials: process.env.CORS_CREDENTIALS === 'true'
+  },
+  logging: {
+    level: (process.env.LOG_LEVEL as any) || 'info',
+    format: (process.env.LOG_FORMAT as any) || 'text'
+  }
+});
+```
+
+**Workflow Service**
+```typescript
+// apps/server/src/services/workflow-service.ts
+import { DatabaseConnection } from '@workflow/database';
+import { WorkflowRepository } from '@workflow/database';
+import { Logger } from '@workflow/utils';
+import type { Result } from '@workflow/types';
+
+const logger = Logger.create('workflow-service');
+
+export namespace WorkflowService {
+  export interface CreateWorkflowParams {
+    name: string;
+    description?: string;
+    definition: {
+      steps: Array<{
+        id: string;
+        type: string;
+        config: Record<string, unknown>;
+      }>;
+    };
+    retryConfig?: {
+      maxAttempts: number;
+      backoffMs?: number;
+      exponentialBackoff?: boolean;
+    };
+    panicConfig?: {
+      maxRestartAttempts: number;
+      restartDelayMs: number;
+      enableAutoRestart: boolean;
+    };
+  }
+
+  export interface WorkflowInfo {
+    id: string;
+    name: string;
+    description?: string;
+    definition: any;
+    createdAt: Date;
+  }
+
+  export const createWorkflow = async (params: CreateWorkflowParams): Promise<WorkflowInfo> => {
+    const db = DatabaseConnection.getConnection();
+    
+    const workflow = {
+      definition: {
+        id: params.name,
+        name: params.name,
+        description: params.description,
+        steps: params.definition.steps
+      },
+      createdAt: new Date(),
+      version: 1
+    };
+
+    const result = await WorkflowRepository.save(db, workflow);
+    if (!result.success) {
+      throw result.error;
+    }
+
+    logger.info(`Created workflow: ${params.name}`);
+    
+    return {
+      id: params.name,
+      name: params.name,
+      description: params.description,
+      definition: params.definition,
+      createdAt: workflow.createdAt
+    };
+  };
+
+  export const getWorkflow = async (id: string): Promise<WorkflowInfo | null> => {
+    const db = DatabaseConnection.getConnection();
+    
+    const result = await WorkflowRepository.findById(db, id);
+    if (!result.success) {
+      throw result.error;
+    }
+
+    if (!result.data) {
+      return null;
+    }
+
+    return {
+      id: result.data.definition.id,
+      name: result.data.definition.name,
+      description: result.data.definition.description,
+      definition: result.data.definition,
+      createdAt: result.data.createdAt
+    };
+  };
+
+  export const listWorkflows = async (): Promise<WorkflowInfo[]> => {
+    const db = DatabaseConnection.getConnection();
+    
+    const result = await WorkflowRepository.findAll(db);
+    if (!result.success) {
+      throw result.error;
+    }
+
+    return result.data.map(w => ({
+      id: w.definition.id,
+      name: w.definition.name,
+      description: w.definition.description,
+      definition: w.definition,
+      createdAt: w.createdAt
+    }));
+  };
+
+  export const deleteWorkflow = async (id: string): Promise<boolean> => {
+    const db = DatabaseConnection.getConnection();
+    
+    // Check if workflow exists
+    const existing = await WorkflowRepository.findById(db, id);
+    if (!existing.success || !existing.data) {
+      return false;
+    }
+
+    // Delete workflow (implementation depends on repository)
+    // For now, we'll assume a delete method exists
+    logger.info(`Deleted workflow: ${id}`);
+    return true;
+  };
+
+  export const executeStep = async (
+    stepType: string,
+    config: Record<string, unknown>,
+    context: any
+  ): Promise<any> => {
+    // Step execution logic based on type
+    switch (stepType) {
+      case 'log':
+        console.log(config.message || 'Step executed');
+        return { logged: true, timestamp: new Date() };
+      
+      case 'delay':
+        const ms = (config.duration as number) || 1000;
+        await new Promise(resolve => setTimeout(resolve, ms));
+        return { delayed: ms };
+      
+      case 'http':
+        const url = config.url as string;
+        const response = await fetch(url);
+        return { status: response.status, data: await response.text() };
+      
+      default:
+        throw new Error(`Unknown step type: ${stepType}`);
+    }
+  };
+}
+```
+
+**Server Package Configuration**
+```json
+// apps/server/package.json
+{
+  "name": "workflow-server",
+  "version": "1.0.0",
+  "description": "Development server for workflow library",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "build": "bun build src/index.ts --outdir dist --target node",
+    "start": "bun dist/index.js",
+    "test": "bun test",
+    "test:integration": "bun test tests/integration",
+    "typecheck": "bun tsc --noEmit"
+  },
+  "dependencies": {
+    "@workflow/core": "workspace:*",
+    "@workflow/database": "workspace:*",
+    "@workflow/types": "workspace:*",
+    "@workflow/utils": "workspace:*",
+    "express": "^4.18.0",
+    "cors": "^2.8.5",
+    "helmet": "^7.0.0",
+    "jsonwebtoken": "^9.0.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.0",
+    "@types/cors": "^2.8.0",
+    "@types/jsonwebtoken": "^9.0.0",
+    "typescript": "^5.0.0",
+    "supertest": "^6.3.0"
+  }
+}
+```
+
+**Server Integration Tests**
+```typescript
+// apps/server/tests/integration/workflows.test.ts
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import request from 'supertest';
+import { app } from '../../src/index';
+import { DatabaseConnection } from '@workflow/database';
+
+describe('Workflow API Integration', () => {
+  beforeAll(async () => {
+    DatabaseConnection.initialize(':memory:');
+  });
+
+  afterAll(async () => {
+    DatabaseConnection.close();
+  });
+
+  test('should create and retrieve workflow', async () => {
+    const workflowData = {
+      name: 'test-workflow',
+      description: 'Test workflow for integration testing',
+      definition: {
+        steps: [
+          {
+            id: 'step1',
+            type: 'log',
+            config: { message: 'Hello from step 1' }
+          },
+          {
+            id: 'step2',
+            type: 'delay',
+            config: { duration: 100 }
+          }
+        ]
+      }
+    };
+
+    // Create workflow
+    const createResponse = await request(app)
+      .post('/api/workflows')
+      .send(workflowData)
+      .expect(201);
+
+    expect(createResponse.body.name).toBe('test-workflow');
+    expect(createResponse.body.status).toBe('created');
+
+    // Retrieve workflow
+    const getResponse = await request(app)
+      .get(`/api/workflows/${createResponse.body.id}`)
+      .expect(200);
+
+    expect(getResponse.body.name).toBe('test-workflow');
+    expect(getResponse.body.definition.steps).toHaveLength(2);
+  });
+
+  test('should start workflow execution', async () => {
+    const workflowData = {
+      name: 'execution-test',
+      definition: {
+        steps: [
+          {
+            id: 'step1',
+            type: 'log',
+            config: { message: 'Execution test' }
+          }
+        ]
+      }
+    };
+
+    // Create workflow
+    const createResponse = await request(app)
+      .post('/api/workflows')
+      .send(workflowData)
+      .expect(201);
+
+    // Start execution
+    const executionData = {
+      executionId: crypto.randomUUID(),
+      input: { test: 'data' }
+    };
+
+    const startResponse = await request(app)
+      .post(`/api/workflows/${createResponse.body.id}/start`)
+      .send(executionData)
+      .expect(202);
+
+    expect(startResponse.body.executionId).toBe(executionData.executionId);
+    expect(startResponse.body.status).toBe('running');
+  });
+
+  test('should validate request data', async () => {
+    // Invalid workflow data
+    const invalidWorkflow = {
+      name: '', // Empty name should fail validation
+      definition: {
+        steps: []
+      }
+    };
+
+    await request(app)
+      .post('/api/workflows')
+      .send(invalidWorkflow)
+      .expect(400);
+
+    // Invalid execution data
+    const invalidExecution = {
+      executionId: 'invalid-uuid', // Invalid UUID format
+      input: {}
+    };
+
+    await request(app)
+      .post('/api/workflows/test/start')
+      .send(invalidExecution)
+      .expect(400);
+  });
+});
+```
 
 ### 1. Core Library API
 
@@ -149,6 +958,7 @@ EOF
 ```typescript
 // packages/core/src/workflow.ts
 import type { WorkflowDefinition, WorkflowContext, ExecutionResult } from '@workflow/types';
+import { WorkflowDefinitionSchema, WorkflowInputSchema, ValidationError } from '@workflow/types';
 import { WorkflowEngine } from './engine';
 import { createContext } from './context';
 
@@ -156,24 +966,83 @@ export namespace Workflow {
   const definitions = new Map<string, WorkflowDefinition>();
   
   export const define = (name: string, handler: (ctx: WorkflowContext) => Promise<void>): void => {
-    definitions.set(name, { name, handler });
+    // Validate workflow definition with Zod
+    const definitionData = { name, handler };
+    const validation = WorkflowDefinitionSchema.safeParse(definitionData);
+    
+    if (!validation.success) {
+      throw new ValidationError(
+        `Invalid workflow definition for "${name}"`,
+        validation.error
+      );
+    }
+    
+    definitions.set(name, validation.data);
   };
   
-  export const start = async (name: string, executionId: string, input?: any): Promise<ExecutionResult> => {
+  export const start = async (
+    name: string, 
+    executionId: string, 
+    input?: any,
+    retryConfig?: RetryConfig,
+    panicConfig?: PanicConfig
+  ): Promise<ExecutionResult> => {
+    // Validate input parameters with Zod
+    const inputData = { workflowName: name, executionId, input, retryConfig, panicConfig };
+    const validation = WorkflowInputSchema.safeParse(inputData);
+    
+    if (!validation.success) {
+      throw new ValidationError(
+        `Invalid workflow start parameters`,
+        validation.error
+      );
+    }
+    
     const definition = definitions.get(name);
     if (!definition) {
       throw new Error(`Workflow "${name}" not found`);
     }
     
-    const context = createContext(name, executionId, input);
+    const context = createContext(name, executionId, input, retryConfig, panicConfig);
     return await WorkflowEngine.execute(definition, context);
   };
   
   export const resume = async (executionId: string): Promise<ExecutionResult> => {
+    // Validate execution ID format
+    const validation = z.string().uuid().safeParse(executionId);
+    if (!validation.success) {
+      throw new ValidationError(
+        `Invalid execution ID format: ${executionId}`,
+        validation.error
+      );
+    }
+    
     return await WorkflowEngine.resume(executionId);
   };
   
-  export const getStatus = async (executionId: string): Promise<ExecutionStatus> => {
+  export const restart = async (executionId: string): Promise<ExecutionResult> => {
+    // Validate execution ID format
+    const validation = z.string().uuid().safeParse(executionId);
+    if (!validation.success) {
+      throw new ValidationError(
+        `Invalid execution ID format: ${executionId}`,
+        validation.error
+      );
+    }
+    
+    return await WorkflowEngine.restart(executionId);
+  };
+  
+  export const getStatus = async (executionId: string): Promise<ExecutionResult> => {
+    // Validate execution ID format
+    const validation = z.string().uuid().safeParse(executionId);
+    if (!validation.success) {
+      throw new ValidationError(
+        `Invalid execution ID format: ${executionId}`,
+        validation.error
+      );
+    }
+    
     return await WorkflowEngine.getStatus(executionId);
   };
 }
@@ -269,49 +1138,95 @@ export const createContext = (workflowName: string, executionId: string, input?:
 **Core Types (@workflow/types)**
 ```typescript
 // packages/types/src/workflow.ts
-export interface WorkflowDefinition {
-  readonly name: string;
-  readonly handler: (ctx: WorkflowContext) => Promise<void>;
-}
+import { z } from 'zod';
 
-export interface WorkflowContext {
-  readonly workflowName: string;
-  readonly executionId: string;
-  readonly input?: any;
-  readonly attempt: number;
-  readonly restartAttempt: number;
-  
+// Zod schemas for runtime validation
+export const WorkflowDefinitionSchema = z.object({
+  name: z.string().min(1, 'Workflow name is required'),
+  handler: z.function().args(z.any()).returns(z.promise(z.void()))
+});
+
+export const WorkflowContextSchema = z.object({
+  workflowName: z.string(),
+  executionId: z.string().uuid('Invalid execution ID format'),
+  input: z.any().optional(),
+  attempt: z.number().int().positive(),
+  restartAttempt: z.number().int().positive()
+});
+
+export const ExecutionStatusSchema = z.enum([
+  'running', 'completed', 'failed', 'sleeping', 'panicked', 'restarting'
+]);
+
+export const StepStatusSchema = z.enum([
+  'pending', 'running', 'completed', 'failed', 'sleeping', 'retrying'
+]);
+
+export const StepResultSchema = z.object({
+  stepId: z.string().min(1),
+  status: StepStatusSchema,
+  result: z.any().optional(),
+  error: z.instanceof(Error).optional(),
+  startedAt: z.date(),
+  completedAt: z.date().optional()
+});
+
+export const ExecutionResultSchema = z.object({
+  executionId: z.string().uuid(),
+  status: ExecutionStatusSchema,
+  startedAt: z.date(),
+  completedAt: z.date().optional(),
+  error: z.instanceof(Error).optional(),
+  steps: z.record(z.string(), StepResultSchema),
+  restartAttempt: z.number().int().positive()
+});
+
+export const RetryConfigSchema = z.object({
+  maxAttempts: z.number().int().min(1).max(10),
+  backoffMs: z.number().int().min(0).optional(),
+  exponentialBackoff: z.boolean().optional()
+});
+
+export const PanicConfigSchema = z.object({
+  maxRestartAttempts: z.number().int().min(1).max(5),
+  restartDelayMs: z.number().int().min(1000),
+  enableAutoRestart: z.boolean()
+});
+
+// TypeScript types inferred from Zod schemas
+export interface WorkflowDefinition extends z.infer<typeof WorkflowDefinitionSchema> {}
+
+export interface WorkflowContext extends z.infer<typeof WorkflowContextSchema> {
   step<T>(stepId: string, handler: () => Promise<T>): Promise<T>;
   sleep(stepId: string, ms: number): Promise<void>;
 }
 
-export interface ExecutionResult {
-  readonly executionId: string;
-  readonly status: ExecutionStatus;
-  readonly startedAt: Date;
-  readonly completedAt?: Date;
-  readonly error?: Error;
-  readonly steps: Record<string, StepResult>;
-  readonly restartAttempt: number;
-}
+export interface ExecutionResult extends z.infer<typeof ExecutionResultSchema> {}
 
-export type ExecutionStatus = 'running' | 'completed' | 'failed' | 'sleeping' | 'panicked' | 'restarting';
+export type ExecutionStatus = z.infer<typeof ExecutionStatusSchema>;
 
-export interface StepResult {
-  readonly stepId: string;
-  readonly status: StepStatus;
-  readonly result?: any;
-  readonly error?: Error;
-  readonly startedAt: Date;
-  readonly completedAt?: Date;
-}
+export interface StepResult extends z.infer<typeof StepResultSchema> {}
 
-export type StepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'sleeping' | 'retrying';
+export type StepStatus = z.infer<typeof StepStatusSchema>;
+
+export interface RetryConfig extends z.infer<typeof RetryConfigSchema> {}
+
+export interface PanicConfig extends z.infer<typeof PanicConfigSchema> {}
 
 // packages/types/src/common.ts
+import { z } from 'zod';
+
 export type Result<T, E = Error> = 
   | { success: true; data: T }
   | { success: false; error: E };
+
+export const WorkflowInputSchema = z.object({
+  workflowName: z.string().min(1),
+  executionId: z.string().uuid(),
+  input: z.any().optional(),
+  retryConfig: RetryConfigSchema.optional(),
+  panicConfig: PanicConfigSchema.optional()
+});
 
 export class SleepInterrupt extends Error {
   constructor(public readonly wakeTime: number) {
@@ -344,16 +1259,14 @@ export class PanicError extends Error {
   }
 }
 
-export interface RetryConfig {
-  readonly maxAttempts: number;
-  readonly backoffMs?: number;
-  readonly exponentialBackoff?: boolean;
-}
-
-export interface PanicConfig {
-  readonly maxRestartAttempts: number;
-  readonly restartDelayMs: number;
-  readonly enableAutoRestart: boolean;
+export class ValidationError extends Error {
+  constructor(
+    message: string,
+    public readonly validationErrors: z.ZodError
+  ) {
+    super(message);
+    this.name = 'ValidationError';
+  }
 }
 ```
 ### 4. Error Handling and Recovery
@@ -528,6 +1441,9 @@ export namespace WorkflowEngine {
 **Enhanced Context with Configurable Retry and Panic Recovery**
 ```typescript
 // packages/core/src/context.ts - Enhanced version
+import { z } from 'zod';
+import { WorkflowContextSchema, RetryConfigSchema, PanicConfigSchema, ValidationError } from '@workflow/types';
+
 export const createContext = (
   workflowName: string, 
   executionId: string, 
@@ -535,6 +1451,39 @@ export const createContext = (
   retryConfig?: RetryConfig,
   panicConfig?: PanicConfig
 ): WorkflowContext => {
+  // Validate context parameters with Zod
+  const contextData = { workflowName, executionId, input, attempt: 1, restartAttempt: 1 };
+  const contextValidation = WorkflowContextSchema.safeParse(contextData);
+  
+  if (!contextValidation.success) {
+    throw new ValidationError(
+      `Invalid workflow context`,
+      contextValidation.error
+    );
+  }
+
+  // Validate retry configuration
+  if (retryConfig) {
+    const retryValidation = RetryConfigSchema.safeParse(retryConfig);
+    if (!retryValidation.success) {
+      throw new ValidationError(
+        `Invalid retry configuration`,
+        retryValidation.error
+      );
+    }
+  }
+
+  // Validate panic configuration
+  if (panicConfig) {
+    const panicValidation = PanicConfigSchema.safeParse(panicConfig);
+    if (!panicValidation.success) {
+      throw new ValidationError(
+        `Invalid panic configuration`,
+        panicValidation.error
+      );
+    }
+  }
+
   const state = StateManager.load(executionId);
   const defaultRetryConfig: RetryConfig = {
     maxAttempts: 3,
@@ -557,6 +1506,15 @@ export const createContext = (
     restartAttempt: state.restartAttempt || 1,
     
     step: async <T>(stepId: string, handler: () => Promise<T>): Promise<T> => {
+      // Validate step ID
+      const stepIdValidation = z.string().min(1, 'Step ID cannot be empty').safeParse(stepId);
+      if (!stepIdValidation.success) {
+        throw new ValidationError(
+          `Invalid step ID: ${stepId}`,
+          stepIdValidation.error
+        );
+      }
+
       // Check if step already completed
       const existingResult = state.steps[stepId];
       if (existingResult?.status === 'completed') {
@@ -570,8 +1528,8 @@ export const createContext = (
           // Mark step as running
           await StateManager.updateStep(executionId, stepId, 'running', null, null, attempt);
           
-          // Execute step with panic detection
-          const result = await executeStepWithPanicDetection(handler, stepId, attempt);
+          // Execute step with panic detection and input validation
+          const result = await executeStepWithValidation(handler, stepId, attempt);
           
           // Mark step as completed
           await StateManager.updateStep(executionId, stepId, 'completed', result);
@@ -625,6 +1583,19 @@ export const createContext = (
     },
     
     sleep: async (stepId: string, ms: number): Promise<void> => {
+      // Validate sleep parameters
+      const sleepValidation = z.object({
+        stepId: z.string().min(1, 'Step ID cannot be empty'),
+        ms: z.number().int().min(0, 'Sleep duration must be non-negative').max(300000, 'Sleep duration cannot exceed 5 minutes')
+      }).safeParse({ stepId, ms });
+
+      if (!sleepValidation.success) {
+        throw new ValidationError(
+          `Invalid sleep parameters`,
+          sleepValidation.error
+        );
+      }
+
       // Check if sleep already completed
       const existingResult = state.steps[stepId];
       if (existingResult?.status === 'completed') {
@@ -647,13 +1618,29 @@ export const createContext = (
   };
 };
 
-const executeStepWithPanicDetection = async <T>(
+const executeStepWithValidation = async <T>(
   handler: () => Promise<T>,
   stepId: string,
   attempt: number
 ): Promise<T> => {
   try {
-    return await handler();
+    const result = await handler();
+    
+    // Validate step result is serializable for state persistence
+    try {
+      JSON.stringify(result);
+    } catch (serializationError) {
+      throw new ValidationError(
+        `Step "${stepId}" returned non-serializable result`,
+        new z.ZodError([{
+          code: 'custom',
+          message: 'Result must be JSON serializable',
+          path: ['result']
+        }])
+      );
+    }
+    
+    return result;
   } catch (error) {
     // Enhanced panic detection
     if (isPanicError(error)) {
@@ -721,7 +1708,8 @@ const isPanicError = (error: any): boolean => {
   "dependencies": {
     "@workflow/types": "workspace:*",
     "@workflow/database": "workspace:*",
-    "@workflow/utils": "workspace:*"
+    "@workflow/utils": "workspace:*",
+    "zod": "^3.22.0"
   },
   "devDependencies": {
     "typescript": "^5.0.0",
@@ -1275,12 +2263,13 @@ export namespace StepExecutor {
 }
 ```
 
-**Co-located Unit Tests**
+**Co-located Unit Tests with Zod Validation**
 ```typescript
 // packages/core/src/engine.test.ts
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { z } from 'zod';
 import { WorkflowEngine } from './engine';
-import { PanicError, WorkflowError } from '@workflow/types';
+import { PanicError, WorkflowError, ValidationError } from '@workflow/types';
 import { StateManager } from './state';
 
 describe('WorkflowEngine', () => {
@@ -1294,7 +2283,7 @@ describe('WorkflowEngine', () => {
     await StateManager.close();
   });
 
-  test('should execute workflow successfully', async () => {
+  test('should execute workflow successfully with valid input', async () => {
     const definition = {
       name: 'test-workflow',
       handler: async (ctx) => {
@@ -1304,7 +2293,7 @@ describe('WorkflowEngine', () => {
 
     const context = {
       workflowName: 'test-workflow',
-      executionId: 'test-exec-1',
+      executionId: crypto.randomUUID(),
       attempt: 1,
       restartAttempt: 1,
       step: async (id, handler) => handler(),
@@ -1314,7 +2303,12 @@ describe('WorkflowEngine', () => {
     const result = await WorkflowEngine.execute(definition, context);
     
     expect(result.status).toBe('completed');
-    expect(result.executionId).toBe('test-exec-1');
+    expect(result.executionId).toBe(context.executionId);
+  });
+
+  test('should validate execution ID format', async () => {
+    await expect(WorkflowEngine.getStatus('invalid-uuid'))
+      .rejects.toThrow(ValidationError);
   });
 
   test('should handle panic errors and schedule restart', async () => {
@@ -1327,7 +2321,7 @@ describe('WorkflowEngine', () => {
 
     const context = {
       workflowName: 'panic-workflow',
-      executionId: 'panic-exec-1',
+      executionId: crypto.randomUUID(),
       attempt: 1,
       restartAttempt: 1,
       step: async (id, handler) => handler(),
@@ -1337,72 +2331,125 @@ describe('WorkflowEngine', () => {
     await expect(WorkflowEngine.execute(definition, context))
       .rejects.toThrow(PanicError);
   });
+});
+```
 
-  test('should restart panicked workflow', async () => {
-    // First, create a panicked execution
-    await StateManager.updateExecution('restart-test', 'panicked');
+**Context Unit Tests with Schema Validation**
+```typescript
+// packages/core/src/context.test.ts
+import { describe, test, expect, beforeEach } from 'bun:test';
+import { z } from 'zod';
+import { createContext } from './context';
+import { PanicError, WorkflowError, ValidationError } from '@workflow/types';
+
+describe('WorkflowContext', () => {
+  test('should validate context creation parameters', () => {
+    expect(() => createContext('', crypto.randomUUID(), {}))
+      .toThrow(ValidationError);
     
-    const result = await WorkflowEngine.restart('restart-test');
+    expect(() => createContext('valid-name', 'invalid-uuid', {}))
+      .toThrow(ValidationError);
+  });
+
+  test('should validate retry configuration', () => {
+    const validUuid = crypto.randomUUID();
     
-    expect(result.status).toBe('restarting');
+    expect(() => createContext('test', validUuid, {}, { maxAttempts: 0 }))
+      .toThrow(ValidationError);
+    
+    expect(() => createContext('test', validUuid, {}, { maxAttempts: 15 }))
+      .toThrow(ValidationError);
+  });
+
+  test('should validate step ID format', async () => {
+    const context = createContext('test-workflow', crypto.randomUUID(), {});
+    
+    await expect(context.step('', async () => 'result'))
+      .rejects.toThrow(ValidationError);
+  });
+
+  test('should validate sleep parameters', async () => {
+    const context = createContext('test-workflow', crypto.randomUUID(), {});
+    
+    await expect(context.sleep('', 1000))
+      .rejects.toThrow(ValidationError);
+    
+    await expect(context.sleep('valid-step', -1))
+      .rejects.toThrow(ValidationError);
+    
+    await expect(context.sleep('valid-step', 400000))
+      .rejects.toThrow(ValidationError);
+  });
+
+  test('should validate step result serializability', async () => {
+    const context = createContext('test-workflow', crypto.randomUUID(), {});
+    
+    // Circular reference should fail validation
+    const circularObj: any = { name: 'test' };
+    circularObj.self = circularObj;
+    
+    await expect(context.step('circular-step', async () => circularObj))
+      .rejects.toThrow(ValidationError);
+  });
+
+  test('should execute step successfully with valid data', async () => {
+    const context = createContext('test-workflow', crypto.randomUUID(), {});
+    
+    const result = await context.step('test-step', async () => {
+      return { data: 'step-result', timestamp: new Date() };
+    });
+    
+    expect(result.data).toBe('step-result');
+    expect(result.timestamp).toBeInstanceOf(Date);
   });
 });
 ```
 
-**Context Unit Tests**
+**Workflow Definition Tests with Zod**
 ```typescript
-// packages/core/src/context.test.ts
-import { describe, test, expect, beforeEach } from 'bun:test';
-import { createContext } from './context';
-import { PanicError, WorkflowError } from '@workflow/types';
+// packages/core/src/workflow.test.ts
+import { describe, test, expect } from 'bun:test';
+import { z } from 'zod';
+import { Workflow } from './workflow';
+import { ValidationError } from '@workflow/types';
 
-describe('WorkflowContext', () => {
-  test('should execute step successfully', async () => {
-    const context = createContext('test-workflow', 'test-exec', {});
+describe('Workflow', () => {
+  test('should validate workflow definition', () => {
+    expect(() => Workflow.define('', async () => {}))
+      .toThrow(ValidationError);
     
-    const result = await context.step('test-step', async () => {
-      return 'step-result';
-    });
-    
-    expect(result).toBe('step-result');
+    expect(() => Workflow.define('valid-name', null as any))
+      .toThrow(ValidationError);
   });
 
-  test('should detect panic errors', async () => {
-    const context = createContext('panic-workflow', 'panic-exec', {});
+  test('should validate start parameters', async () => {
+    Workflow.define('test-workflow', async (ctx) => {
+      await ctx.step('step1', async () => 'result');
+    });
+
+    await expect(Workflow.start('', crypto.randomUUID()))
+      .rejects.toThrow(ValidationError);
     
-    await expect(context.step('panic-step', async () => {
-      throw new Error('out of memory');
-    })).rejects.toThrow(PanicError);
+    await expect(Workflow.start('test-workflow', 'invalid-uuid'))
+      .rejects.toThrow(ValidationError);
   });
 
-  test('should retry failed steps', async () => {
-    let attempts = 0;
-    const context = createContext('retry-workflow', 'retry-exec', {}, {
-      maxAttempts: 3,
-      backoffMs: 10
+  test('should validate retry configuration in start', async () => {
+    Workflow.define('retry-test', async (ctx) => {
+      await ctx.step('step1', async () => 'result');
     });
-    
-    const result = await context.step('retry-step', async () => {
-      attempts++;
-      if (attempts < 3) {
-        throw new Error('temporary failure');
-      }
-      return 'success';
-    });
-    
-    expect(result).toBe('success');
-    expect(attempts).toBe(3);
+
+    await expect(Workflow.start('retry-test', crypto.randomUUID(), {}, { maxAttempts: 0 }))
+      .rejects.toThrow(ValidationError);
   });
 
-  test('should throw WorkflowError after max retries', async () => {
-    const context = createContext('fail-workflow', 'fail-exec', {}, {
-      maxAttempts: 2,
-      backoffMs: 10
+  test('should start workflow with valid parameters', async () => {
+    Workflow.define('valid-workflow', async (ctx) => {
+      await ctx.step('step1', async () => 'result');
     });
-    
-    await expect(context.step('fail-step', async () => {
-      throw new Error('persistent failure');
-    })).rejects.toThrow(WorkflowError);
+
+    const result = await Workflow.start('valid-workflow', crypto.randomUUID(), { test: 'data' });
+    expect(result.status).toBe('completed');
   });
 });
 ```
@@ -1800,48 +2847,106 @@ Workflow.define("delayed-task", async (ctx) => {
 });
 ```
 
-### Complex Business Workflow
+### Complex Business Workflow with Validation
 ```typescript
+import { z } from 'zod';
+
+// Define input schema for type safety
+const OrderInputSchema = z.object({
+  orderId: z.string().uuid('Invalid order ID format'),
+  customerId: z.string().uuid('Invalid customer ID format'),
+  items: z.array(z.object({
+    id: z.string(),
+    name: z.string().min(1),
+    quantity: z.number().int().positive(),
+    price: z.number().positive()
+  })).min(1, 'Order must contain at least one item'),
+  totalAmount: z.number().positive()
+});
+
+type OrderInput = z.infer<typeof OrderInputSchema>;
+
 Workflow.define("order-processing", async (ctx) => {
-    const order = ctx.input as { orderId: string; items: any[] };
-    
-    // Validate order
-    const validatedOrder = await ctx.step("validate-order", async () => {
-        if (!order.orderId || !order.items.length) {
-            throw new Error("Invalid order data");
+    // Validate and parse input with Zod
+    const order = await ctx.step("validate-order", async () => {
+        const validation = OrderInputSchema.safeParse(ctx.input);
+        if (!validation.success) {
+            throw new ValidationError(
+                "Invalid order data",
+                validation.error
+            );
         }
-        return order;
+        return validation.data;
     });
     
-    // Check inventory
+    // Check inventory with validated data
     const inventory = await ctx.step("check-inventory", async () => {
         // Simulate inventory check that might fail
         if (ctx.attempt < 2) {
             throw new Error("Inventory service unavailable");
         }
-        return { available: true };
+        
+        // Validate inventory response
+        const inventorySchema = z.object({
+            available: z.boolean(),
+            reservedItems: z.array(z.string())
+        });
+        
+        const mockInventory = { available: true, reservedItems: order.items.map(i => i.id) };
+        return inventorySchema.parse(mockInventory);
     });
     
     // Wait for payment processing
     await ctx.sleep("payment-delay", 2000);
     
-    // Process payment
+    // Process payment with validation
     const payment = await ctx.step("process-payment", async () => {
-        return { paymentId: "pay-123", status: "completed" };
+        const paymentSchema = z.object({
+            paymentId: z.string().uuid(),
+            status: z.enum(['pending', 'completed', 'failed']),
+            amount: z.number().positive()
+        });
+        
+        const mockPayment = {
+            paymentId: crypto.randomUUID(),
+            status: 'completed' as const,
+            amount: order.totalAmount
+        };
+        
+        return paymentSchema.parse(mockPayment);
     });
     
-    // Ship order
+    // Ship order with validated tracking
     await ctx.step("ship-order", async () => {
-        console.log(`Shipping order ${validatedOrder.orderId}`);
-        return { trackingId: "track-456" };
+        const shippingSchema = z.object({
+            trackingId: z.string().min(1),
+            carrier: z.string().min(1),
+            estimatedDelivery: z.date()
+        });
+        
+        console.log(`Shipping order ${order.orderId}`);
+        
+        const mockShipping = {
+            trackingId: `TRACK-${Date.now()}`,
+            carrier: "FastShip",
+            estimatedDelivery: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+        };
+        
+        return shippingSchema.parse(mockShipping);
     });
 });
 
-// Start the workflow
-await Workflow.start("order-processing", "order-789", {
-    orderId: "order-789",
-    items: [{ id: 1, name: "Product A" }]
-});
+// Start the workflow with validated input
+const orderInput: OrderInput = {
+    orderId: crypto.randomUUID(),
+    customerId: crypto.randomUUID(),
+    items: [
+        { id: "item-1", name: "Product A", quantity: 2, price: 29.99 }
+    ],
+    totalAmount: 59.98
+};
+
+await Workflow.start("order-processing", crypto.randomUUID(), orderInput);
 ```
 
 ## Best Practices
@@ -1854,8 +2959,9 @@ await Workflow.start("order-processing", "order-789", {
 6. **Leverage sleep for rate limiting** and external service delays
 7. **Return meaningful data** from steps for subsequent steps
 8. **Keep workflows focused** on a single business process
-9. **Use TypeScript types** for input and step return values
-10. **Test error scenarios** thoroughly with unit and integration tests
+9. **Use Zod schemas** for input validation and type safety
+10. **Validate step results** to ensure they're serializable
+11. **Test error scenarios** thoroughly with unit and integration tests
 11. **Monitor execution status** in production environments
 12. **Implement circuit breakers** for external service calls
 13. **Log step failures** with sufficient context for debugging
@@ -1864,7 +2970,39 @@ await Workflow.start("order-processing", "order-789", {
 
 ## Error Handling Strategies
 
-### 1. Transient vs Permanent Errors
+### 1. Input Validation with Zod
+```typescript
+import { z } from 'zod';
+
+const UserDataSchema = z.object({
+  userId: z.string().uuid(),
+  email: z.string().email(),
+  preferences: z.object({
+    notifications: z.boolean(),
+    theme: z.enum(['light', 'dark'])
+  })
+});
+
+Workflow.define("user-onboarding", async (ctx) => {
+    // Validate input at workflow start
+    const userData = await ctx.step("validate-input", async () => {
+        const validation = UserDataSchema.safeParse(ctx.input);
+        if (!validation.success) {
+            throw new ValidationError(
+                "Invalid user data provided",
+                validation.error
+            );
+        }
+        return validation.data;
+    });
+    
+    await ctx.step("create-profile", async () => {
+        // userData is now fully typed and validated
+        console.log(`Creating profile for ${userData.email}`);
+        return { profileId: crypto.randomUUID() };
+    });
+});
+```
 ```typescript
 Workflow.define("smart-retry", async (ctx) => {
     await ctx.step("api-call", async () => {
@@ -1885,23 +3023,65 @@ Workflow.define("smart-retry", async (ctx) => {
 });
 ```
 
-### 2. Graceful Degradation
+### 2. Transient vs Permanent Errors
 ```typescript
+Workflow.define("smart-retry", async (ctx) => {
+    await ctx.step("api-call", async () => {
+        try {
+            return await callExternalAPI();
+        } catch (error) {
+            // Classify error type
+            if (error.code === 'NETWORK_ERROR' || error.code === 'TIMEOUT') {
+                // Transient error - let retry mechanism handle it
+                throw error;
+            } else if (error.code === 'INVALID_AUTH' || error.code === 'NOT_FOUND') {
+                // Permanent error - don't retry
+                throw new Error(`Permanent failure: ${error.message}`);
+            }
+            throw error;
+        }
+    });
+});
+```
+
+### 3. Graceful Degradation with Validation
+```typescript
+import { z } from 'zod';
+
+const UserSchema = z.object({
+  id: z.string().uuid(),
+  name: z.string(),
+  email: z.string().email(),
+  lastActive: z.date()
+});
+
 Workflow.define("resilient-workflow", async (ctx) => {
     let userData;
     
     try {
         userData = await ctx.step("fetch-user", async () => {
-            return await getUserFromAPI(ctx.input.userId);
+            const apiResponse = await getUserFromAPI(ctx.input.userId);
+            // Validate API response structure
+            return UserSchema.parse(apiResponse);
         });
     } catch (error) {
-        // Fallback to cached data
+        // Fallback to cached data with validation
         userData = await ctx.step("fallback-user", async () => {
-            return await getUserFromCache(ctx.input.userId);
+            const cachedData = await getUserFromCache(ctx.input.userId);
+            // Validate cached data structure
+            const validation = UserSchema.safeParse(cachedData);
+            if (!validation.success) {
+                throw new ValidationError(
+                    "Both API and cache data are invalid",
+                    validation.error
+                );
+            }
+            return validation.data;
         });
     }
     
     await ctx.step("process-user", async () => {
+        // userData is guaranteed to be valid User type
         return processUser(userData);
     });
 });
@@ -1921,8 +3101,8 @@ bun run build        # Build for production
 npm publish          # Publish to npm registry
 
 # Usage in other projects
-bun add @workflow/core
-npm install @workflow/core
+bun add @workflow/core zod
+npm install @workflow/core zod
 ```
 
 This guide provides the foundation for building a workflow library with a fluent API that can be easily integrated into any TypeScript project.
