@@ -4861,133 +4861,90 @@ workflow cleanup --older-than 30
 workflow cleanup --status failed --older-than 7
 ```
 
-### Workflow Definition File Examples
+### Workflow Definition Examples
 
-**Simple Log Workflow**
-```json
-// workflows/simple-log.json
-{
-  "name": "simple-log",
-  "description": "A simple workflow that logs messages",
-  "steps": [
-    {
-      "id": "welcome",
-      "type": "log",
-      "config": {
-        "message": "Welcome to the workflow!"
-      }
-    },
-    {
-      "id": "wait",
-      "type": "delay",
-      "config": {
-        "duration": 2000
-      }
-    },
-    {
-      "id": "goodbye",
-      "type": "log",
-      "config": {
-        "message": "Workflow completed successfully!"
-      }
-    }
-  ],
-  "retryConfig": {
-    "maxAttempts": 3,
-    "backoffMs": 1000,
-    "exponentialBackoff": true
-  }
-}
-```
+> **Note:** This library is currently in development (see [PROGRESS.md](./PROGRESS.md)). The examples below show the planned API design and will be available once implementation is complete.
 
-**HTTP API Workflow**
-```json
-// workflows/api-workflow.json
-{
-  "name": "api-workflow",
-  "description": "Workflow that calls external APIs",
-  "steps": [
-    {
-      "id": "fetch-users",
-      "type": "http",
-      "config": {
-        "url": "https://jsonplaceholder.typicode.com/users"
-      }
-    },
-    {
-      "id": "process-delay",
-      "type": "delay",
-      "config": {
-        "duration": 1000
-      }
-    },
-    {
-      "id": "fetch-posts",
-      "type": "http",
-      "config": {
-        "url": "https://jsonplaceholder.typicode.com/posts"
-      }
-    },
-    {
-      "id": "completion-log",
-      "type": "log",
-      "config": {
-        "message": "API data fetched successfully"
-      }
-    }
-  ],
-  "retryConfig": {
-    "maxAttempts": 5,
-    "backoffMs": 2000,
-    "exponentialBackoff": true
-  },
-  "panicConfig": {
-    "maxRestartAttempts": 2,
-    "restartDelayMs": 10000,
-    "enableAutoRestart": true
-  }
-}
-```
+The workflow library uses a **programmatic TypeScript API** rather than JSON configuration files. Workflows are defined using the fluent API and executed directly in code.
 
-### Programmatic Usage Examples
-
-**Basic Workflow Definition**
+**Simple Workflow Example**
 ```typescript
 import { Workflow } from '@workflow/core';
-import { WorkflowRegistry } from '@workflow/database';
-
-// Initialize registry
-WorkflowRegistry.initialize({
-  baseDir: './workflows-data'
-});
 
 // Define a simple workflow
-Workflow.define("data-processing", async (ctx) => {
-    const data = await ctx.step("fetch-data", async () => {
-        return { records: [1, 2, 3, 4, 5] };
+Workflow.define("simple-log", async (ctx) => {
+    await ctx.step("welcome", async () => {
+        console.log("Welcome to the workflow!");
+        return { message: "Welcome logged" };
     });
     
-    await ctx.step("process-data", async () => {
-        console.log(`Processing ${data.records.length} records`);
-        return { processed: data.records.length };
-    });
+    await ctx.sleep("wait", 2000);
     
-    await ctx.sleep("wait-before-cleanup", 1000);
-    
-    await ctx.step("cleanup", async () => {
-        console.log("Cleanup completed");
+    await ctx.step("goodbye", async () => {
+        console.log("Workflow completed successfully!");
+        return { message: "Goodbye logged" };
     });
 });
 
-// Start execution
-const result = await Workflow.start("data-processing", crypto.randomUUID());
-console.log("Workflow result:", result);
+// Start execution with retry configuration
+await Workflow.start("simple-log", crypto.randomUUID(), {}, {
+    maxAttempts: 3,
+    backoffMs: 1000,
+    exponentialBackoff: true
+});
 ```
 
-**Workflow with Error Handling and Retries**
+**API Integration Workflow Example**
 ```typescript
+import { Workflow } from '@workflow/core';
+
+Workflow.define("api-workflow", async (ctx) => {
+    const users = await ctx.step("fetch-users", async () => {
+        const response = await fetch("https://jsonplaceholder.typicode.com/users");
+        if (!response.ok) {
+            throw new Error(`API returned ${response.status}`);
+        }
+        return await response.json();
+    });
+    
+    await ctx.sleep("process-delay", 1000);
+    
+    const posts = await ctx.step("fetch-posts", async () => {
+        const response = await fetch("https://jsonplaceholder.typicode.com/posts");
+        if (!response.ok) {
+            throw new Error(`API returned ${response.status}`);
+        }
+        return await response.json();
+    });
+    
+    await ctx.step("completion-log", async () => {
+        console.log(`Fetched ${users.length} users and ${posts.length} posts`);
+        return { users: users.length, posts: posts.length };
+    });
+});
+
+// Start with retry and panic recovery configuration
+await Workflow.start("api-workflow", crypto.randomUUID(), {}, {
+    maxAttempts: 5,
+    backoffMs: 2000,
+    exponentialBackoff: true
+}, {
+    maxRestartAttempts: 2,
+    restartDelayMs: 10000,
+    enableAutoRestart: true
+});
+```
+
+### Advanced Usage Examples
+
+> **Implementation Status:** These examples represent the planned API design. See [PROGRESS.md](./PROGRESS.md) for current implementation status.
+
+**Workflow with Error Handling**
+```typescript
+import { Workflow } from '@workflow/core';
+
 Workflow.define("resilient-api-call", async (ctx) => {
-    // This step will retry automatically on failure
+    // Step with automatic retry on failure
     const apiData = await ctx.step("api-call", async () => {
         const response = await fetch("https://api.example.com/data");
         if (!response.ok) {
@@ -5004,7 +4961,6 @@ Workflow.define("resilient-api-call", async (ctx) => {
     });
     
     await ctx.step("save-data", async () => {
-        // Simulate database save
         console.log("Saving data:", apiData.id);
         return { saved: true };
     });
@@ -5022,58 +4978,44 @@ await Workflow.start("resilient-api-call", crypto.randomUUID(), {}, {
 });
 ```
 
-**Workflow Discovery and Management**
+**Workflow State Management**
 ```typescript
-import { WorkflowRegistry, WorkflowDatabase } from '@workflow/database';
+import { Workflow } from '@workflow/core';
 
-// List all available workflows
-const workflowsResult = await WorkflowRegistry.listWorkflows();
-if (workflowsResult.success) {
-    console.log("Available workflows:");
-    workflowsResult.data.forEach(workflow => {
-        console.log(`- ${workflow.name}: ${workflow.executionCount} executions`);
-        console.log(`  Last run: ${workflow.lastExecutionAt?.toLocaleString() || 'Never'}`);
-        console.log(`  Status: ${workflow.status}`);
-    });
+// Check workflow execution status
+const status = await Workflow.getStatus("execution-id-123");
+console.log(`Status: ${status.status}`);
+console.log(`Steps completed: ${Object.keys(status.steps).length}`);
+
+// Resume a sleeping workflow
+if (status.status === 'sleeping') {
+    await Workflow.resume("execution-id-123");
 }
 
-// Get detailed stats for a specific workflow
-const statsResult = await WorkflowRegistry.getWorkflowStats("data-processing");
-if (statsResult.success && statsResult.data) {
-    const stats = statsResult.data;
-    console.log(`Workflow: ${stats.name}`);
-    console.log(`Database: ${stats.dbPath}`);
-    console.log(`Total executions: ${stats.executionCount}`);
-    console.log(`Created: ${stats.createdAt.toLocaleString()}`);
-}
-
-// List recent executions for a workflow
-const executionsResult = await WorkflowDatabase.listExecutions("data-processing", {
-    limit: 10
-});
-if (executionsResult.success) {
-    console.log("Recent executions:");
-    executionsResult.data.forEach(exec => {
-        console.log(`- ${exec.executionId}: ${exec.status} (${exec.startedAt.toLocaleString()})`);
-    });
+// Restart a failed workflow
+if (status.status === 'failed') {
+    await Workflow.restart("execution-id-123");
 }
 ```
 
-### Database Structure Examples
+### Planned Database Structure
 
-Each workflow gets its own SQLite database file:
+> **Implementation Status:** Database schema design is planned but not yet implemented. See [PROGRESS.md](./PROGRESS.md) Phase 3 for database implementation status.
+
+The library will use SQLite for state persistence with a per-workflow database approach:
+
+**Planned Directory Structure:**
 ```
 ~/.workflows/
-├── registry.db              # Central registry of all workflows
-├── data-processing.db        # Database for "data-processing" workflow
-├── api-workflow.db          # Database for "api-workflow" workflow
-├── simple-log.db            # Database for "simple-log" workflow
-└── resilient-api-call.db    # Database for "resilient-api-call" workflow
+├── registry.db              # Central registry (planned)
+├── data-processing.db        # Per-workflow database (planned)
+├── api-workflow.db          # Per-workflow database (planned)
+└── simple-log.db            # Per-workflow database (planned)
 ```
 
-**Registry Database Schema:**
+**Planned Registry Schema:**
 ```sql
--- registry.db
+-- registry.db (not yet implemented)
 CREATE TABLE workflow_registry (
     name TEXT PRIMARY KEY,
     db_path TEXT NOT NULL,
@@ -5084,9 +5026,9 @@ CREATE TABLE workflow_registry (
 );
 ```
 
-**Per-Workflow Database Schema:**
+**Planned Per-Workflow Schema:**
 ```sql
--- {workflow-name}.db
+-- {workflow-name}.db (not yet implemented)
 CREATE TABLE executions (
     id TEXT PRIMARY KEY,
     status TEXT NOT NULL,
@@ -5111,22 +5053,30 @@ CREATE TABLE steps (
 );
 ```
 
-## Library Commands
+### Development Commands
 
+> **Current Status:** Library is in early development. See [PROGRESS.md](./PROGRESS.md) for implementation roadmap.
+
+**Planned Development Commands:**
 ```bash
-# Development commands
+# Setup (when implemented)
 bun install          # Install dependencies
 bun run build        # Build the library
 bun run test         # Run tests
 bun run typecheck    # Type checking
 
-# Publishing commands
+# Publishing (future)
 bun run build        # Build for production
 npm publish          # Publish to npm registry
 
-# Usage in other projects
+# Usage in projects (when available)
 bun add @workflow/core zod
 npm install @workflow/core zod
 ```
 
-This guide provides the foundation for building a workflow library with a fluent API that can be easily integrated into any TypeScript project.
+**Current Project Status:**
+- 📋 **Planning Phase**: API design and documentation complete
+- 🚧 **Implementation**: Not yet started (0% complete)
+- 📖 **Next Steps**: See [PROGRESS.md](./PROGRESS.md) for detailed roadmap
+
+This guide provides the foundation for building a workflow library with a fluent API that will be easily integrated into TypeScript projects once implementation is complete.
