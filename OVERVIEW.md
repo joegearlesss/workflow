@@ -174,7 +174,7 @@ await Workflow.start("email-notification", crypto.randomUUID(), {
 
 ## Benefits
 
-- **Easy Integration**: Simple npm install and import in any TypeScript/Bun project
+- **Easy Integration**: Simple bun add and import in any TypeScript/Bun project
 - **Maintainable**: Functional programming reduces complexity
 - **Reliable**: Bun's SQLite client provides ACID transactions
 - **Resilient**: Automatic panic detection and restart capabilities

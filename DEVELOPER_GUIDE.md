@@ -50,9 +50,6 @@ function processData(data: Record<string, unknown>): ProcessedData {
 ```bash
 # In your TypeScript project
 bun add @workflow/core
-
-# Or with npm
-npm install @workflow/core
 ```
 
 ### Basic Usage
@@ -1660,7 +1657,7 @@ const isPanicError = (error: unknown): boolean => {
     "README.md"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node --format esm && bun build src/index.ts --outdir dist --outfile index.cjs --target node --format cjs",
+    "build": "bun build src/index.ts --outdir dist --target bun && bun build src/index.ts --outdir dist --outfile index.cjs --target bun --format cjs",
     "typecheck": "bun tsc --noEmit",
     "test": "bun test",
     "prepublishOnly": "bun run build"
@@ -2549,7 +2546,7 @@ export const CLIConfig = {
   },
   "scripts": {
     "dev": "bun --watch src/index.ts",
-    "build": "bun build src/index.ts --outdir dist --target node --format esm",
+    "build": "bun build src/index.ts --outdir dist --target bun",
     "start": "bun dist/index.js",
     "test": "bun test",
     "typecheck": "bun tsc --noEmit"
@@ -4371,7 +4368,7 @@ npm publish          # Publish to npm registry
 
 # Usage in projects (when available)
 bun add @workflow/core zod
-npm install @workflow/core zod
+bun add @workflow/core zod
 ```
 
 **Current Project Status:**
