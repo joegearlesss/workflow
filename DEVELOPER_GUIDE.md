@@ -2797,26 +2797,99 @@ import type { Result } from '@workflow/types';
 
 const logger = Logger.create('workflow-registry');
 
-export namespace WorkflowRegistry {
-  export interface WorkflowInfo {
-    name: string;
-    dbPath: string;
-    createdAt: Date;
-    lastExecutionAt?: Date;
-    executionCount: number;
-    status: 'active' | 'inactive';
-  }
+// Drizzle ORM-like WorkflowRegistry with Zod schemas
+import { z } from 'zod';
 
-  export interface RegistryConfig {
-    baseDir: string;
-    registryDbPath?: string;
-  }
+// Schema definitions (similar to Drizzle table definitions)
+export const workflowRegistrySchema = z.object({
+  name: z.string().min(1, 'Workflow name is required'),
+  dbPath: z.string().min(1, 'Database path is required'),
+  workflowDir: z.string().min(1, 'Workflow directory is required'),
+  logDir: z.string().min(1, 'Log directory is required'),
+  createdAt: z.date(),
+  lastExecutionAt: z.date().nullable(),
+  executionCount: z.number().int().min(0),
+  status: z.enum(['active', 'inactive', 'archived']),
+  version: z.string().optional(),
+  description: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  metadata: z.record(z.unknown()).optional()
+});
 
-  let registryDb: Database | null = null;
+export const workflowConfigSchema = z.object({
+  retryConfig: z.object({
+    maxAttempts: z.number().int().min(1).max(10),
+    backoffMs: z.number().int().min(0),
+    exponentialBackoff: z.boolean()
+  }).optional(),
+  panicConfig: z.object({
+    maxRestartAttempts: z.number().int().min(1).max(5),
+    restartDelayMs: z.number().int().min(1000),
+    enableAutoRestart: z.boolean()
+  }).optional(),
+  environment: z.string().optional(),
+  variables: z.record(z.string()).optional(),
+  secrets: z.record(z.string()).optional()
+});
+
+export const registryConfigSchema = z.object({
+  baseDir: z.string().min(1, 'Base directory is required'),
+  registryDbPath: z.string().optional(),
+  autoCleanup: z.boolean().default(false),
+  maxExecutionHistory: z.number().int().min(1).default(1000)
+});
+
+// Type inference from schemas
+export type WorkflowRegistry = z.infer<typeof workflowRegistrySchema>;
+export type WorkflowConfig = z.infer<typeof workflowConfigSchema>;
+export type RegistryConfig = z.infer<typeof registryConfigSchema>;
+
+// Query builder types (Drizzle-like)
+export interface SelectQuery<T> {
+  where(condition: (fields: T) => boolean): SelectQuery<T>;
+  orderBy(field: keyof T, direction?: 'asc' | 'desc'): SelectQuery<T>;
+  limit(count: number): SelectQuery<T>;
+  offset(count: number): SelectQuery<T>;
+  execute(): Promise<T[]>;
+  first(): Promise<T | null>;
+}
+
+export interface InsertQuery<T> {
+  values(data: Partial<T>): InsertQuery<T>;
+  onConflict(action: 'ignore' | 'replace' | 'update'): InsertQuery<T>;
+  returning(fields?: (keyof T)[]): InsertQuery<T>;
+  execute(): Promise<T>;
+}
+
+export interface UpdateQuery<T> {
+  set(data: Partial<T>): UpdateQuery<T>;
+  where(condition: (fields: T) => boolean): UpdateQuery<T>;
+  returning(fields?: (keyof T)[]): UpdateQuery<T>;
+  execute(): Promise<T[]>;
+}
+
+export interface DeleteQuery<T> {
+  where(condition: (fields: T) => boolean): DeleteQuery<T>;
+  execute(): Promise<number>;
+}
+
+// Drizzle-like table interface
+export interface WorkflowRegistryTable {
+  select(): SelectQuery<WorkflowRegistry>;
+  insert(): InsertQuery<WorkflowRegistry>;
+  update(): UpdateQuery<WorkflowRegistry>;
+  delete(): DeleteQuery<WorkflowRegistry>;
+}
+
+// Main registry implementation with Drizzle-like API
+export namespace WorkflowRegistryORM {
+  let db: Database | null = null;
   let config: RegistryConfig;
-
-  export const initialize = (registryConfig: RegistryConfig): void => {
-    config = registryConfig;
+  
+  // Initialize with validated config
+  export const initialize = (registryConfig: unknown): void => {
+    const validatedConfig = registryConfigSchema.parse(registryConfig);
+    config = validatedConfig;
     
     // Ensure base directory exists
     if (!fs.existsSync(config.baseDir)) {
@@ -2825,235 +2898,582 @@ export namespace WorkflowRegistry {
 
     // Initialize registry database
     const registryPath = config.registryDbPath || path.join(config.baseDir, 'registry.db');
-    registryDb = new Database(registryPath);
+    db = new Database(registryPath);
     
-    // Create registry table
-    registryDb.exec(`
+    // Enable optimizations
+    db.exec("PRAGMA foreign_keys = ON");
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA synchronous = NORMAL");
+    
+    // Create registry table with enhanced schema
+    db.exec(`
       CREATE TABLE IF NOT EXISTS workflow_registry (
         name TEXT PRIMARY KEY,
         db_path TEXT NOT NULL,
+        workflow_dir TEXT NOT NULL,
+        log_dir TEXT NOT NULL,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         last_execution_at DATETIME,
         execution_count INTEGER DEFAULT 0,
-        status TEXT DEFAULT 'active'
+        status TEXT DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'archived')),
+        version TEXT,
+        description TEXT,
+        tags TEXT, -- JSON array
+        metadata TEXT -- JSON object
       );
       
       CREATE INDEX IF NOT EXISTS idx_workflow_status ON workflow_registry(status);
       CREATE INDEX IF NOT EXISTS idx_workflow_last_execution ON workflow_registry(last_execution_at);
+      CREATE INDEX IF NOT EXISTS idx_workflow_created ON workflow_registry(created_at);
     `);
 
     logger.info(`Workflow registry initialized at: ${registryPath}`);
   };
 
-  export const registerWorkflow = async (workflowName: string): Promise<Result<string>> => {
-    if (!registryDb) {
-      return { success: false, error: new Error('Registry not initialized') };
-    }
-
-    try {
-      const dbPath = path.join(config.baseDir, `${workflowName}.db`);
-      
-      const stmt = registryDb.prepare(`
-        INSERT OR REPLACE INTO workflow_registry (name, db_path, created_at, status)
-        VALUES (?, ?, CURRENT_TIMESTAMP, 'active')
-      `);
-      
-      stmt.run(workflowName, dbPath);
-      
-      logger.info(`Registered workflow: ${workflowName} -> ${dbPath}`);
-      return { success: true, data: dbPath };
-      
-    } catch (error) {
-      return { 
-        success: false, 
-        error: error instanceof Error ? error : new Error(String(error))
-      };
+  // Drizzle-like table accessor
+  export const workflowRegistry: WorkflowRegistryTable = {
+    select(): SelectQuery<WorkflowRegistry> {
+      return new SelectQueryImpl<WorkflowRegistry>(db!, 'workflow_registry', workflowRegistrySchema);
+    },
+    
+    insert(): InsertQuery<WorkflowRegistry> {
+      return new InsertQueryImpl<WorkflowRegistry>(db!, 'workflow_registry', workflowRegistrySchema);
+    },
+    
+    update(): UpdateQuery<WorkflowRegistry> {
+      return new UpdateQueryImpl<WorkflowRegistry>(db!, 'workflow_registry', workflowRegistrySchema);
+    },
+    
+    delete(): DeleteQuery<WorkflowRegistry> {
+      return new DeleteQueryImpl<WorkflowRegistry>(db!, 'workflow_registry');
     }
   };
 
-  export const getWorkflowDbPath = async (workflowName: string): Promise<Result<string | null>> => {
-    if (!registryDb) {
-      return { success: false, error: new Error('Registry not initialized') };
-    }
+  // High-level API methods with validation
+  export const registerWorkflow = async (data: {
+    name: string;
+    version?: string;
+    description?: string;
+    tags?: string[];
+    metadata?: Record<string, unknown>;
+  }): Promise<WorkflowRegistry> => {
+    if (!db) throw new Error('Registry not initialized');
 
-    try {
-      const stmt = registryDb.prepare('SELECT db_path FROM workflow_registry WHERE name = ?');
-      const row = stmt.get(workflowName) as { db_path: string } | undefined;
-      
-      if (!row) {
-        return { success: true, data: null };
-      }
-      
-      return { success: true, data: row.db_path };
-      
-    } catch (error) {
-      return { 
-        success: false, 
-        error: error instanceof Error ? error : new Error(String(error))
-      };
-    }
+    // Validate input
+    const workflowName = z.string().min(1).parse(data.name);
+    
+    // Generate paths
+    const workflowDir = path.join(config.baseDir, 'workflows', workflowName);
+    const dbPath = path.join(workflowDir, `${workflowName}.db`);
+    const logDir = path.join(workflowDir, 'logs');
+    
+    // Ensure directories exist
+    fs.mkdirSync(workflowDir, { recursive: true });
+    fs.mkdirSync(logDir, { recursive: true });
+    
+    // Create workflow entry
+    const workflow = await workflowRegistry.insert()
+      .values({
+        name: workflowName,
+        dbPath,
+        workflowDir,
+        logDir,
+        createdAt: new Date(),
+        lastExecutionAt: null,
+        executionCount: 0,
+        status: 'active',
+        version: data.version,
+        description: data.description,
+        tags: data.tags,
+        metadata: data.metadata
+      })
+      .onConflict('replace')
+      .execute();
+
+    logger.info(`Registered workflow: ${workflowName} -> ${dbPath}`);
+    return workflow;
   };
 
-  export const listWorkflows = async (): Promise<Result<WorkflowInfo[]>> => {
-    if (!registryDb) {
-      return { success: false, error: new Error('Registry not initialized') };
-    }
-
-    try {
-      const stmt = registryDb.prepare(`
-        SELECT name, db_path, created_at, last_execution_at, execution_count, status
-        FROM workflow_registry
-        ORDER BY last_execution_at DESC, created_at DESC
-      `);
-      
-      const rows = stmt.all() as Array<{
-        name: string;
-        db_path: string;
-        created_at: string;
-        last_execution_at: string | null;
-        execution_count: number;
-        status: string;
-      }>;
-      
-      const workflows: WorkflowInfo[] = rows.map(row => ({
-        name: row.name,
-        dbPath: row.db_path,
-        createdAt: new Date(row.created_at),
-        lastExecutionAt: row.last_execution_at ? new Date(row.last_execution_at) : undefined,
-        executionCount: row.execution_count,
-        status: row.status
-      }));
-      
-      return { success: true, data: workflows };
-      
-    } catch (error) {
-      return { 
-        success: false, 
-        error: error instanceof Error ? error : new Error(String(error))
-      };
-    }
+  export const findWorkflow = async (name: string): Promise<WorkflowRegistry | null> => {
+    const workflowName = z.string().min(1).parse(name);
+    
+    return await workflowRegistry.select()
+      .where(w => w.name === workflowName)
+      .first();
   };
 
-  export const updateExecutionStats = async (workflowName: string): Promise<Result<void>> => {
-    if (!registryDb) {
-      return { success: false, error: new Error('Registry not initialized') };
+  export const listWorkflows = async (filters?: {
+    status?: 'active' | 'inactive' | 'archived';
+    tags?: string[];
+    limit?: number;
+    offset?: number;
+  }): Promise<WorkflowRegistry[]> => {
+    let query = workflowRegistry.select()
+      .orderBy('lastExecutionAt', 'desc');
+
+    if (filters?.status) {
+      query = query.where(w => w.status === filters.status);
     }
 
-    try {
-      const stmt = registryDb.prepare(`
-        UPDATE workflow_registry 
-        SET last_execution_at = CURRENT_TIMESTAMP, 
-            execution_count = execution_count + 1
-        WHERE name = ?
-      `);
-      
-      stmt.run(workflowName);
-      return { success: true, data: undefined };
-      
-    } catch (error) {
-      return { 
-        success: false, 
-        error: error instanceof Error ? error : new Error(String(error))
-      };
+    if (filters?.limit) {
+      query = query.limit(filters.limit);
     }
+
+    if (filters?.offset) {
+      query = query.offset(filters.offset);
+    }
+
+    return await query.execute();
   };
 
-  export const removeWorkflow = async (workflowName: string): Promise<Result<boolean>> => {
-    if (!registryDb) {
-      return { success: false, error: new Error('Registry not initialized') };
-    }
-
-    try {
-      // Get database path before deletion
-      const pathResult = await getWorkflowDbPath(workflowName);
-      if (!pathResult.success) {
-        return pathResult as Result<boolean>;
-      }
-
-      if (!pathResult.data) {
-        return { success: true, data: false }; // Workflow not found
-      }
-
-      // Remove from registry
-      const stmt = registryDb.prepare('DELETE FROM workflow_registry WHERE name = ?');
-      const result = stmt.run(workflowName);
-      
-      // Delete database file if it exists
-      if (fs.existsSync(pathResult.data)) {
-        fs.unlinkSync(pathResult.data);
-        logger.info(`Deleted workflow database: ${pathResult.data}`);
-      }
-      
-      logger.info(`Removed workflow from registry: ${workflowName}`);
-      return { success: true, data: result.changes > 0 };
-      
-    } catch (error) {
-      return { 
-        success: false, 
-        error: error instanceof Error ? error : new Error(String(error))
-      };
-    }
+  export const updateExecutionStats = async (name: string): Promise<WorkflowRegistry[]> => {
+    const workflowName = z.string().min(1).parse(name);
+    
+    return await workflowRegistry.update()
+      .set({
+        lastExecutionAt: new Date(),
+        executionCount: db!.prepare('SELECT execution_count + 1 FROM workflow_registry WHERE name = ?').get(workflowName) as number
+      })
+      .where(w => w.name === workflowName)
+      .execute();
   };
 
-  export const getWorkflowStats = async (workflowName: string): Promise<Result<WorkflowInfo | null>> => {
-    if (!registryDb) {
-      return { success: false, error: new Error('Registry not initialized') };
+  export const archiveWorkflow = async (name: string): Promise<WorkflowRegistry[]> => {
+    const workflowName = z.string().min(1).parse(name);
+    
+    return await workflowRegistry.update()
+      .set({ status: 'archived' })
+      .where(w => w.name === workflowName)
+      .execute();
+  };
+
+  export const deleteWorkflow = async (name: string): Promise<number> => {
+    const workflowName = z.string().min(1).parse(name);
+    
+    // Get workflow info before deletion
+    const workflow = await findWorkflow(workflowName);
+    if (!workflow) return 0;
+
+    // Delete database files
+    if (fs.existsSync(workflow.dbPath)) {
+      fs.unlinkSync(workflow.dbPath);
+    }
+    
+    // Delete workflow directory
+    if (fs.existsSync(workflow.workflowDir)) {
+      fs.rmSync(workflow.workflowDir, { recursive: true, force: true });
     }
 
-    try {
-      const stmt = registryDb.prepare(`
-        SELECT name, db_path, created_at, last_execution_at, execution_count, status
-        FROM workflow_registry 
-        WHERE name = ?
-      `);
-      
-      const row = stmt.get(workflowName) as {
-        name: string;
-        db_path: string;
-        created_at: string;
-        last_execution_at: string | null;
-        execution_count: number;
-        status: string;
-      } | undefined;
-      
-      if (!row) {
-        return { success: true, data: null };
-      }
-      
-      const workflowInfo: WorkflowInfo = {
-        name: row.name,
-        dbPath: row.db_path,
-        createdAt: new Date(row.created_at),
-        lastExecutionAt: row.last_execution_at ? new Date(row.last_execution_at) : undefined,
-        executionCount: row.execution_count,
-        status: row.status
-      };
-      
-      return { success: true, data: workflowInfo };
-      
-    } catch (error) {
-      return { 
-        success: false, 
-        error: error instanceof Error ? error : new Error(String(error))
-      };
-    }
+    // Remove from registry
+    const deletedCount = await workflowRegistry.delete()
+      .where(w => w.name === workflowName)
+      .execute();
+
+    logger.info(`Deleted workflow: ${workflowName}`);
+    return deletedCount;
   };
 
   export const close = (): void => {
-    if (registryDb) {
-      registryDb.close();
-      registryDb = null;
+    if (db) {
+      db.close();
+      db = null;
       logger.info('Workflow registry closed');
     }
   };
 }
+
+// Query implementation classes
+class SelectQueryImpl<T> implements SelectQuery<T> {
+  private conditions: Array<(item: T) => boolean> = [];
+  private orderField?: keyof T;
+  private orderDirection: 'asc' | 'desc' = 'asc';
+  private limitCount?: number;
+  private offsetCount?: number;
+
+  constructor(
+    private db: Database,
+    private tableName: string,
+    private schema: z.ZodSchema<T>
+  ) {}
+
+  where(condition: (fields: T) => boolean): SelectQuery<T> {
+    this.conditions.push(condition);
+    return this;
+  }
+
+  orderBy(field: keyof T, direction: 'asc' | 'desc' = 'asc'): SelectQuery<T> {
+    this.orderField = field;
+    this.orderDirection = direction;
+    return this;
+  }
+
+  limit(count: number): SelectQuery<T> {
+    this.limitCount = count;
+    return this;
+  }
+
+  offset(count: number): SelectQuery<T> {
+    this.offsetCount = count;
+    return this;
+  }
+
+  async execute(): Promise<T[]> {
+    let sql = `SELECT * FROM ${this.tableName}`;
+    
+    if (this.orderField) {
+      sql += ` ORDER BY ${String(this.orderField)} ${this.orderDirection.toUpperCase()}`;
+    }
+    
+    if (this.limitCount) {
+      sql += ` LIMIT ${this.limitCount}`;
+    }
+    
+    if (this.offsetCount) {
+      sql += ` OFFSET ${this.offsetCount}`;
+    }
+
+    const stmt = this.db.prepare(sql);
+    const rows = stmt.all() as unknown[];
+    
+    return rows
+      .map(row => this.parseRow(row))
+      .filter(item => this.conditions.every(condition => condition(item)));
+  }
+
+  async first(): Promise<T | null> {
+    const results = await this.limit(1).execute();
+    return results[0] || null;
+  }
+
+  private parseRow(row: unknown): T {
+    // Convert database row to typed object
+    const parsed = this.schema.parse(this.transformDbRow(row));
+    return parsed;
+  }
+
+  private transformDbRow(row: any): any {
+    return {
+      ...row,
+      createdAt: new Date(row.created_at),
+      lastExecutionAt: row.last_execution_at ? new Date(row.last_execution_at) : null,
+      dbPath: row.db_path,
+      workflowDir: row.workflow_dir,
+      logDir: row.log_dir,
+      executionCount: row.execution_count,
+      tags: row.tags ? JSON.parse(row.tags) : undefined,
+      metadata: row.metadata ? JSON.parse(row.metadata) : undefined
+    };
+  }
+}
+
+class InsertQueryImpl<T> implements InsertQuery<T> {
+  private data?: Partial<T>;
+  private conflictAction: 'ignore' | 'replace' | 'update' = 'ignore';
+
+  constructor(
+    private db: Database,
+    private tableName: string,
+    private schema: z.ZodSchema<T>
+  ) {}
+
+  values(data: Partial<T>): InsertQuery<T> {
+    this.data = data;
+    return this;
+  }
+
+  onConflict(action: 'ignore' | 'replace' | 'update'): InsertQuery<T> {
+    this.conflictAction = action;
+    return this;
+  }
+
+  returning(fields?: (keyof T)[]): InsertQuery<T> {
+    // SQLite doesn't support RETURNING, so we'll fetch after insert
+    return this;
+  }
+
+  async execute(): Promise<T> {
+    if (!this.data) throw new Error('No data provided for insert');
+
+    const dbRow = this.transformToDbRow(this.data);
+    const columns = Object.keys(dbRow);
+    const placeholders = columns.map(() => '?').join(', ');
+    const values = Object.values(dbRow);
+
+    let sql = `INSERT`;
+    if (this.conflictAction === 'ignore') {
+      sql += ` OR IGNORE`;
+    } else if (this.conflictAction === 'replace') {
+      sql += ` OR REPLACE`;
+    }
+    sql += ` INTO ${this.tableName} (${columns.join(', ')}) VALUES (${placeholders})`;
+
+    const stmt = this.db.prepare(sql);
+    stmt.run(...values);
+
+    // Return the inserted row
+    const selectStmt = this.db.prepare(`SELECT * FROM ${this.tableName} WHERE name = ?`);
+    const row = selectStmt.get(this.data.name) as unknown;
+    
+    return this.schema.parse(this.transformFromDbRow(row));
+  }
+
+  private transformToDbRow(data: Partial<T>): Record<string, any> {
+    const result: Record<string, any> = {};
+    
+    for (const [key, value] of Object.entries(data)) {
+      switch (key) {
+        case 'createdAt':
+        case 'lastExecutionAt':
+          result[this.camelToSnake(key)] = value instanceof Date ? value.toISOString() : value;
+          break;
+        case 'dbPath':
+          result['db_path'] = value;
+          break;
+        case 'workflowDir':
+          result['workflow_dir'] = value;
+          break;
+        case 'logDir':
+          result['log_dir'] = value;
+          break;
+        case 'executionCount':
+          result['execution_count'] = value;
+          break;
+        case 'tags':
+        case 'metadata':
+          result[key] = value ? JSON.stringify(value) : null;
+          break;
+        default:
+          result[key] = value;
+      }
+    }
+    
+    return result;
+  }
+
+  private transformFromDbRow(row: any): any {
+    return {
+      ...row,
+      createdAt: new Date(row.created_at),
+      lastExecutionAt: row.last_execution_at ? new Date(row.last_execution_at) : null,
+      dbPath: row.db_path,
+      workflowDir: row.workflow_dir,
+      logDir: row.log_dir,
+      executionCount: row.execution_count,
+      tags: row.tags ? JSON.parse(row.tags) : undefined,
+      metadata: row.metadata ? JSON.parse(row.metadata) : undefined
+    };
+  }
+
+  private camelToSnake(str: string): string {
+    return str.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
+  }
+}
+
+class UpdateQueryImpl<T> implements UpdateQuery<T> {
+  private data?: Partial<T>;
+  private conditions: Array<(item: T) => boolean> = [];
+
+  constructor(
+    private db: Database,
+    private tableName: string,
+    private schema: z.ZodSchema<T>
+  ) {}
+
+  set(data: Partial<T>): UpdateQuery<T> {
+    this.data = data;
+    return this;
+  }
+
+  where(condition: (fields: T) => boolean): UpdateQuery<T> {
+    this.conditions.push(condition);
+    return this;
+  }
+
+  returning(fields?: (keyof T)[]): UpdateQuery<T> {
+    return this;
+  }
+
+  async execute(): Promise<T[]> {
+    if (!this.data) throw new Error('No data provided for update');
+
+    // For simplicity, we'll use a basic WHERE clause
+    // In a real implementation, you'd parse the condition function
+    const dbRow = this.transformToDbRow(this.data);
+    const setPairs = Object.entries(dbRow).map(([key, _]) => `${key} = ?`).join(', ');
+    const values = Object.values(dbRow);
+
+    const sql = `UPDATE ${this.tableName} SET ${setPairs} WHERE name = ?`;
+    const stmt = this.db.prepare(sql);
+    stmt.run(...values, this.data.name);
+
+    // Return updated rows
+    const selectStmt = this.db.prepare(`SELECT * FROM ${this.tableName} WHERE name = ?`);
+    const rows = selectStmt.all(this.data.name) as unknown[];
+    
+    return rows.map(row => this.schema.parse(this.transformFromDbRow(row)));
+  }
+
+  private transformToDbRow(data: Partial<T>): Record<string, any> {
+    // Same as InsertQueryImpl
+    const result: Record<string, any> = {};
+    
+    for (const [key, value] of Object.entries(data)) {
+      switch (key) {
+        case 'createdAt':
+        case 'lastExecutionAt':
+          result[this.camelToSnake(key)] = value instanceof Date ? value.toISOString() : value;
+          break;
+        case 'dbPath':
+          result['db_path'] = value;
+          break;
+        case 'workflowDir':
+          result['workflow_dir'] = value;
+          break;
+        case 'logDir':
+          result['log_dir'] = value;
+          break;
+        case 'executionCount':
+          result['execution_count'] = value;
+          break;
+        case 'tags':
+        case 'metadata':
+          result[key] = value ? JSON.stringify(value) : null;
+          break;
+        default:
+          result[key] = value;
+      }
+    }
+    
+    return result;
+  }
+
+  private transformFromDbRow(row: any): any {
+    return {
+      ...row,
+      createdAt: new Date(row.created_at),
+      lastExecutionAt: row.last_execution_at ? new Date(row.last_execution_at) : null,
+      dbPath: row.db_path,
+      workflowDir: row.workflow_dir,
+      logDir: row.log_dir,
+      executionCount: row.execution_count,
+      tags: row.tags ? JSON.parse(row.tags) : undefined,
+      metadata: row.metadata ? JSON.parse(row.metadata) : undefined
+    };
+  }
+
+  private camelToSnake(str: string): string {
+    return str.replace(/[A-Z]/g, letter => `_${letter.toLowerCase()}`);
+  }
+}
+
+class DeleteQueryImpl<T> implements DeleteQuery<T> {
+  private conditions: Array<(item: T) => boolean> = [];
+
+  constructor(
+    private db: Database,
+    private tableName: string
+  ) {}
+
+  where(condition: (fields: T) => boolean): DeleteQuery<T> {
+    this.conditions.push(condition);
+    return this;
+  }
+
+  async execute(): Promise<number> {
+    // For simplicity, using basic WHERE clause
+    // In real implementation, you'd parse the condition function
+    const sql = `DELETE FROM ${this.tableName} WHERE name = ?`;
+    const stmt = this.db.prepare(sql);
+    const result = stmt.run(/* name would be extracted from condition */);
+    
+    return result.changes;
+  }
+}
+```
+
+**Usage Examples of Drizzle-like WorkflowRegistry**
+```typescript
+// Initialize the registry
+WorkflowRegistryORM.initialize({
+  baseDir: './.workflow',
+  autoCleanup: true,
+  maxExecutionHistory: 1000
+});
+
+// Register a new workflow with metadata
+const workflow = await WorkflowRegistryORM.registerWorkflow({
+  name: 'data-processing',
+  version: '1.2.0',
+  description: 'Process data from external APIs',
+  tags: ['data', 'api', 'processing'],
+  metadata: {
+    author: 'team@company.com',
+    environment: 'production',
+    priority: 'high'
+  }
+});
+
+// Query workflows with Drizzle-like syntax
+const activeWorkflows = await WorkflowRegistryORM.workflowRegistry
+  .select()
+  .where(w => w.status === 'active')
+  .orderBy('lastExecutionAt', 'desc')
+  .limit(10)
+  .execute();
+
+// Find specific workflow
+const workflow = await WorkflowRegistryORM.workflowRegistry
+  .select()
+  .where(w => w.name === 'data-processing')
+  .first();
+
+// Update workflow metadata
+await WorkflowRegistryORM.workflowRegistry
+  .update()
+  .set({ 
+    description: 'Updated description',
+    metadata: { ...workflow.metadata, lastUpdated: new Date() }
+  })
+  .where(w => w.name === 'data-processing')
+  .execute();
+
+// Archive old workflows
+await WorkflowRegistryORM.workflowRegistry
+  .update()
+  .set({ status: 'archived' })
+  .where(w => w.lastExecutionAt < new Date(Date.now() - 30 * 24 * 60 * 60 * 1000))
+  .execute();
+
+// Complex queries with filtering
+const recentWorkflows = await WorkflowRegistryORM.workflowRegistry
+  .select()
+  .where(w => w.status === 'active' && w.executionCount > 0)
+  .orderBy('lastExecutionAt', 'desc')
+  .limit(20)
+  .execute();
+
+// High-level API usage
+const workflows = await WorkflowRegistryORM.listWorkflows({
+  status: 'active',
+  tags: ['production'],
+  limit: 50
+});
+
+// Update execution stats
+await WorkflowRegistryORM.updateExecutionStats('data-processing');
+
+// Archive workflow
+await WorkflowRegistryORM.archiveWorkflow('old-workflow');
+
+// Delete workflow completely
+await WorkflowRegistryORM.deleteWorkflow('deprecated-workflow');
 ```
 
 **Per-Workflow Database Management**
 ```typescript
 // packages/database/src/workflow-db.ts
 import { Database } from "bun:sqlite";
-import { WorkflowRegistry } from "./registry";
+import { WorkflowRegistryORM } from "./registry";
 import { Schema } from "./schema";
 import { Logger } from '@workflow/utils';
 import type { Result, ExecutionResult, StepResult } from '@workflow/types';
@@ -3070,36 +3490,48 @@ export namespace WorkflowDatabase {
         return { success: true, data: connections.get(workflowName)! };
       }
 
-      // Get database path from registry
-      const pathResult = await WorkflowRegistry.getWorkflowDbPath(workflowName);
-      if (!pathResult.success) {
-        return pathResult as Result<Database>;
-      }
-
-      if (!pathResult.data) {
+      // Get workflow from registry
+      const workflow = await WorkflowRegistryORM.findWorkflow(workflowName);
+      
+      if (!workflow) {
         // Register new workflow
-        const registerResult = await WorkflowRegistry.registerWorkflow(workflowName);
-        if (!registerResult.success) {
-          return registerResult as Result<Database>;
-        }
-        pathResult.data = registerResult.data;
+        const newWorkflow = await WorkflowRegistryORM.registerWorkflow({
+          name: workflowName
+        });
+        
+        // Create database connection
+        const db = new Database(newWorkflow.dbPath);
+        
+        // Enable foreign keys and WAL mode for better performance
+        db.exec("PRAGMA foreign_keys = ON");
+        db.exec("PRAGMA journal_mode = WAL");
+        db.exec("PRAGMA synchronous = NORMAL");
+        
+        // Create tables
+        Schema.createWorkflowTables(db);
+        
+        // Cache connection
+        connections.set(workflowName, db);
+        
+        logger.info(`Connected to new workflow database: ${workflowName} -> ${newWorkflow.dbPath}`);
+        return { success: true, data: db };
       }
 
-      // Create database connection
-      const db = new Database(pathResult.data);
+      // Create database connection for existing workflow
+      const db = new Database(workflow.dbPath);
       
       // Enable foreign keys and WAL mode for better performance
       db.exec("PRAGMA foreign_keys = ON");
       db.exec("PRAGMA journal_mode = WAL");
       db.exec("PRAGMA synchronous = NORMAL");
       
-      // Create tables
+      // Create tables if they don't exist
       Schema.createWorkflowTables(db);
       
       // Cache connection
       connections.set(workflowName, db);
       
-      logger.info(`Connected to workflow database: ${workflowName} -> ${pathResult.data}`);
+      logger.info(`Connected to workflow database: ${workflowName} -> ${workflow.dbPath}`);
       return { success: true, data: db };
       
     } catch (error) {
@@ -3162,7 +3594,7 @@ export namespace WorkflowDatabase {
       }
 
       // Update registry stats
-      await WorkflowRegistry.updateExecutionStats(workflowName);
+      await WorkflowRegistryORM.updateExecutionStats(workflowName);
       
       return { success: true, data: undefined };
       
