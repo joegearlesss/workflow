@@ -41,6 +41,430 @@ Workflow.define("my-workflow", async (ctx) => {
 await Workflow.start("my-workflow", "execution-id-123");
 ```
 
+**Handling Step Failures with Error Pipes**
+
+```typescript
+import { Workflow } from '@workflow/core';
+
+// Define custom error types
+class ValidationError extends Error {
+    constructor(message: string, public field: string) {
+        super(message);
+        this.name = 'ValidationError';
+    }
+}
+
+class NetworkError extends Error {
+    constructor(message: string, public statusCode: number) {
+        super(message);
+        this.name = 'NetworkError';
+    }
+}
+
+// Define a workflow with error handling pipes
+Workflow.define("error-handling-workflow", async (ctx) => {
+    // Step with error pipe for conditional flow
+    await ctx.step("data-processing", async () => {
+        const data = await fetchExternalData();
+        if (!data.isValid) {
+            throw new ValidationError("Invalid data format", "payload");
+        }
+        return { processedData: data };
+    }).onError({
+        ValidationError: async (error, ctx) => {
+            // Handle validation errors by running data correction
+            await ctx.step("data-correction", async () => {
+                console.log(`Correcting field: ${error.field}`);
+                return { corrected: true };
+            }).execute();
+            // Continue with corrected data
+            return { processedData: { isValid: true, corrected: true } };
+        },
+        NetworkError: async (error, ctx) => {
+            // Handle network errors with exponential backoff
+            if (error.statusCode >= 500) {
+                await ctx.sleep("network-retry-delay", 5000);
+                throw error; // Retry the original step
+            }
+            // For client errors, skip to fallback
+            await ctx.step("fallback-data", async () => {
+                return { processedData: { fallback: true } };
+            }).execute();
+        },
+        default: async (error, ctx) => {
+            // Handle any other errors
+            await ctx.step("error-logging", async () => {
+                console.error("Unexpected error:", error.message);
+                return { logged: true };
+            }).execute();
+            throw error; // Re-throw to fail the workflow
+        }
+    }).execute();
+    
+    await ctx.step("final-processing", async () => {
+        console.log("Processing completed successfully");
+        return { completed: true };
+    }).execute();
+});
+
+// Alternative: Using error branching for different execution paths
+Workflow.define("branching-workflow", async (ctx) => {
+    const result = await ctx.step("risky-operation", async () => {
+        const success = Math.random() > 0.3;
+        if (!success) {
+            throw new Error("Operation failed");
+        }
+        return { success: true, data: "primary-result" };
+    }).catch(async (error, ctx) => {
+        // Error branch - different execution path
+        await ctx.step("fallback-operation", async () => {
+            console.log("Using fallback approach");
+            return { success: false, data: "fallback-result" };
+        }).execute();
+        
+        await ctx.step("notify-admin", async () => {
+            console.log("Notifying admin of fallback usage");
+            return { notified: true };
+        }).execute();
+        
+        return { success: false, data: "fallback-result" };
+    }).execute();
+    
+    // Conditional next steps based on result
+    if (result.success) {
+        await ctx.step("success-cleanup", async () => {
+            console.log("Primary path cleanup");
+            return { cleaned: true };
+        }).execute();
+    } else {
+        await ctx.step("fallback-cleanup", async () => {
+            console.log("Fallback path cleanup");
+            return { cleaned: true };
+        }).execute();
+    }
+});
+
+// Circuit breaker pattern for external service calls
+Workflow.define("circuit-breaker-workflow", async (ctx) => {
+    await ctx.step("external-service-call", async () => {
+        return await callExternalService();
+    }).withCircuitBreaker({
+        failureThreshold: 5,
+        resetTimeout: 30000,
+        onOpen: async (ctx) => {
+            await ctx.step("circuit-open-fallback", async () => {
+                console.log("Circuit breaker open, using cached data");
+                return { cached: true };
+            }).execute();
+        }
+    }).execute();
+});
+
+// Advanced error handling with retry and circuit breaker
+Workflow.define("advanced-error-handling", async (ctx) => {
+    // Step with multiple error handling strategies
+    const apiResult = await ctx.step("api-call", async () => {
+        const response = await fetch('/api/data');
+        if (!response.ok) {
+            if (response.status >= 500) {
+                throw new NetworkError(`Server error: ${response.status}`, response.status);
+            } else {
+                throw new ValidationError(`Client error: ${response.status}`, 'request');
+            }
+        }
+        return await response.json();
+    })
+    .withCircuitBreaker({
+        failureThreshold: 3,
+        resetTimeout: 60000,
+        onOpen: async (ctx) => {
+            await ctx.step("cache-fallback", async () => {
+                console.log("Using cached data due to circuit breaker");
+                return { cached: true, data: getCachedData() };
+            }).execute();
+        }
+    })
+    .onError({
+        NetworkError: async (error, ctx) => {
+            // Exponential backoff for server errors
+            const delay = Math.min(1000 * Math.pow(2, ctx.attempt - 1), 30000);
+            await ctx.sleep(`network-backoff-${ctx.attempt}`, delay);
+            throw error; // Retry with backoff
+        },
+        ValidationError: async (error, ctx) => {
+            // Log validation errors and use default data
+            await ctx.step("validation-error-log", async () => {
+                console.error(`Validation error in field ${error.field}: ${error.message}`);
+                return { logged: true };
+            }).execute();
+            
+            return { data: getDefaultData(), fallback: true };
+        },
+        default: async (error, ctx) => {
+            // Catch-all error handler
+            await ctx.step("unexpected-error-handler", async () => {
+                console.error("Unexpected error:", error);
+                // Send alert to monitoring system
+                await sendAlert({
+                    type: 'workflow_error',
+                    workflow: ctx.workflowName,
+                    execution: ctx.executionId,
+                    error: error.message
+                });
+                return { alerted: true };
+            }).execute();
+            
+            throw error; // Re-throw to fail workflow
+        }
+    })
+    .execute();
+    
+    // Process the result regardless of how it was obtained
+    await ctx.step("process-result", async () => {
+        console.log("Processing result:", apiResult);
+        return { processed: true };
+    }).execute();
+});
+
+// Start execution with retry configuration
+await Workflow.start("error-handling-workflow", "execution-id-456", {}, {
+    maxAttempts: 3,
+    backoffMs: 2000,
+    exponentialBackoff: true
+});
+
+// Helper functions for the examples
+async function fetchExternalData() {
+    // Simulate external API call
+    const success = Math.random() > 0.3;
+    if (!success) {
+        throw new NetworkError("Network timeout", 503);
+    }
+    return { isValid: Math.random() > 0.2, data: "sample-data" };
+}
+
+async function callExternalService() {
+    // Simulate external service call
+    const success = Math.random() > 0.4;
+    if (!success) {
+        throw new Error("Service unavailable");
+    }
+    return { result: "service-data" };
+}
+
+function getCachedData() {
+    return { cached: true, data: "fallback-data" };
+}
+
+function getDefaultData() {
+    return { default: true, data: "default-data" };
+}
+
+async function sendAlert(alert: any) {
+    console.log("Alert sent:", alert);
+}
+```
+
+**Real-World Error Handling Example**
+
+```typescript
+// Complete example: E-commerce order processing workflow with comprehensive error handling
+Workflow.define("order-processing", async (ctx) => {
+    const { orderId, customerId, items } = ctx.input;
+    
+    // Step 1: Validate order data
+    const validationResult = await ctx.step("validate-order", async () => {
+        if (!orderId || !customerId || !items?.length) {
+            throw new ValidationError("Missing required order fields", "order");
+        }
+        
+        // Validate inventory
+        for (const item of items) {
+            const available = await checkInventory(item.productId, item.quantity);
+            if (!available) {
+                throw new ValidationError(`Insufficient inventory for ${item.productId}`, "inventory");
+            }
+        }
+        
+        return { valid: true, totalAmount: calculateTotal(items) };
+    }).onError({
+        ValidationError: async (error, ctx) => {
+            if (error.field === "inventory") {
+                // Try to find alternative products
+                await ctx.step("find-alternatives", async () => {
+                    const alternatives = await findAlternativeProducts(items);
+                    if (alternatives.length > 0) {
+                        return { alternatives, suggested: true };
+                    }
+                    throw new Error("No alternatives available");
+                }).execute();
+                
+                // Notify customer about alternatives
+                await ctx.step("notify-alternatives", async () => {
+                    await sendCustomerNotification(customerId, {
+                        type: "alternatives_available",
+                        alternatives
+                    });
+                    return { notified: true };
+                }).execute();
+                
+                throw error; // Still fail the order, but customer is notified
+            }
+            
+            // For other validation errors, log and fail
+            await ctx.step("log-validation-error", async () => {
+                console.error(`Order validation failed: ${error.message}`);
+                return { logged: true };
+            }).execute();
+            
+            throw error;
+        }
+    }).execute();
+    
+    // Step 2: Process payment with circuit breaker
+    const paymentResult = await ctx.step("process-payment", async () => {
+        const result = await processPayment(customerId, validationResult.totalAmount);
+        if (!result.success) {
+            throw new Error(`Payment failed: ${result.error}`);
+        }
+        return result;
+    }).withCircuitBreaker({
+        failureThreshold: 5,
+        resetTimeout: 60000,
+        onOpen: async (ctx) => {
+            // Payment service is down, queue for later processing
+            await ctx.step("queue-payment", async () => {
+                await queuePaymentForLater(orderId, customerId, validationResult.totalAmount);
+                return { queued: true };
+            }).execute();
+            
+            // Notify customer about delayed processing
+            await ctx.step("notify-payment-delay", async () => {
+                await sendCustomerNotification(customerId, {
+                    type: "payment_delayed",
+                    orderId,
+                    estimatedProcessingTime: "1 hour"
+                });
+                return { notified: true };
+            }).execute();
+        }
+    }).catch(async (error, ctx) => {
+        // Payment failed, try alternative payment methods
+        const alternativeResult = await ctx.step("try-alternative-payment", async () => {
+            const alternatives = await getAlternativePaymentMethods(customerId);
+            for (const method of alternatives) {
+                try {
+                    const result = await processPayment(customerId, validationResult.totalAmount, method);
+                    if (result.success) {
+                        return { success: true, method, ...result };
+                    }
+                } catch (altError) {
+                    console.warn(`Alternative payment method ${method} failed:`, altError.message);
+                }
+            }
+            throw new Error("All payment methods failed");
+        }).execute();
+        
+        return alternativeResult;
+    }).execute();
+    
+    // Step 3: Reserve inventory
+    await ctx.step("reserve-inventory", async () => {
+        const reservations = [];
+        for (const item of items) {
+            const reservation = await reserveInventory(item.productId, item.quantity);
+            reservations.push(reservation);
+        }
+        return { reservations };
+    }).onError({
+        default: async (error, ctx) => {
+            // Inventory reservation failed, refund payment
+            await ctx.step("refund-payment", async () => {
+                await refundPayment(paymentResult.transactionId);
+                return { refunded: true };
+            }).execute();
+            
+            // Notify customer
+            await ctx.step("notify-inventory-failure", async () => {
+                await sendCustomerNotification(customerId, {
+                    type: "order_failed",
+                    reason: "inventory_unavailable",
+                    orderId,
+                    refundId: paymentResult.transactionId
+                });
+                return { notified: true };
+            }).execute();
+            
+            throw error;
+        }
+    }).execute();
+    
+    // Step 4: Create shipping label with retry logic
+    const shippingResult = await ctx.step("create-shipping", async () => {
+        const shippingAddress = await getCustomerShippingAddress(customerId);
+        const label = await createShippingLabel(orderId, shippingAddress, items);
+        return { label, trackingNumber: label.trackingNumber };
+    }).onError({
+        NetworkError: async (error, ctx) => {
+            // Shipping service network error, exponential backoff
+            const delay = Math.min(1000 * Math.pow(2, ctx.attempt - 1), 30000);
+            await ctx.sleep(`shipping-retry-${ctx.attempt}`, delay);
+            throw error; // Retry with backoff
+        },
+        default: async (error, ctx) => {
+            // Shipping failed, but order is valid - create manual shipping task
+            await ctx.step("create-manual-shipping-task", async () => {
+                await createManualShippingTask(orderId, {
+                    customerId,
+                    items,
+                    paymentId: paymentResult.transactionId,
+                    error: error.message
+                });
+                return { manualTaskCreated: true };
+            }).execute();
+            
+            // Use fallback tracking
+            return { 
+                label: null, 
+                trackingNumber: `MANUAL-${orderId}`,
+                requiresManualProcessing: true 
+            };
+        }
+    }).execute();
+    
+    // Step 5: Send confirmation
+    await ctx.step("send-confirmation", async () => {
+        await sendCustomerNotification(customerId, {
+            type: "order_confirmed",
+            orderId,
+            trackingNumber: shippingResult.trackingNumber,
+            estimatedDelivery: calculateDeliveryDate(),
+            requiresManualProcessing: shippingResult.requiresManualProcessing
+        });
+        return { confirmed: true };
+    }).catch(async (error, ctx) => {
+        // Notification failed, but order is complete - log for follow-up
+        await ctx.step("log-notification-failure", async () => {
+            console.error(`Failed to send confirmation for order ${orderId}:`, error.message);
+            await createFollowUpTask("send_confirmation", { orderId, customerId, error: error.message });
+            return { logged: true };
+        }).execute();
+        
+        // Don't fail the workflow for notification issues
+        return { confirmed: false, followUpRequired: true };
+    }).execute();
+    
+    // Final step: Update order status
+    await ctx.step("update-order-status", async () => {
+        await updateOrderStatus(orderId, "confirmed", {
+            paymentId: paymentResult.transactionId,
+            trackingNumber: shippingResult.trackingNumber
+        });
+        return { orderComplete: true };
+    }).execute();
+});
+```
+
 ### Development Setup
 
 ```bash
@@ -1031,65 +1455,168 @@ export namespace Workflow {
 }
 ```
 
-**Workflow Context Implementation**
+**Workflow Context Implementation with Error Pipes**
 ```typescript
 // packages/core/src/context.ts
 import type { WorkflowContext, StepResult } from '@workflow/types';
 import { StateManager } from './state';
 
+// Error handler types
+type ErrorHandler<T> = (error: Error, ctx: WorkflowContext) => Promise<T>;
+type ErrorHandlerMap<T> = Record<string, ErrorHandler<T>> & { default?: ErrorHandler<T> };
+
+// Step builder with error handling capabilities
+class StepBuilder<T> {
+  constructor(
+    private stepId: string,
+    private handler: () => Promise<T>,
+    private context: WorkflowContext
+  ) {}
+
+  // Error pipe for specific error types
+  onError(handlers: ErrorHandlerMap<T>): StepBuilder<T> {
+    this.errorHandlers = handlers;
+    return this;
+  }
+
+  // Catch-all error handler
+  catch(handler: ErrorHandler<T>): StepBuilder<T> {
+    this.catchHandler = handler;
+    return this;
+  }
+
+  // Circuit breaker pattern
+  withCircuitBreaker(config: {
+    failureThreshold: number;
+    resetTimeout: number;
+    onOpen: (ctx: WorkflowContext) => Promise<void>;
+  }): StepBuilder<T> {
+    this.circuitBreakerConfig = config;
+    return this;
+  }
+
+  // Execute the step with error handling
+  async execute(): Promise<T> {
+    const { stepId, handler, context } = this;
+    const state = StateManager.load(context.executionId);
+    
+    // Check if step already completed
+    const existingResult = state.steps[stepId];
+    if (existingResult?.status === 'completed') {
+      return existingResult.result as T;
+    }
+
+    // Check circuit breaker state
+    if (this.circuitBreakerConfig) {
+      const circuitState = await StateManager.getCircuitBreakerState(stepId);
+      if (circuitState.isOpen) {
+        await this.circuitBreakerConfig.onOpen(context);
+        return;
+      }
+    }
+
+    try {
+      // Mark step as running
+      await StateManager.updateStep(context.executionId, stepId, 'running');
+      
+      // Execute step
+      const result = await handler();
+      
+      // Reset circuit breaker on success
+      if (this.circuitBreakerConfig) {
+        await StateManager.resetCircuitBreaker(stepId);
+      }
+      
+      // Mark step as completed
+      await StateManager.updateStep(context.executionId, stepId, 'completed', result);
+      
+      return result;
+      
+    } catch (error) {
+      // Update circuit breaker failure count
+      if (this.circuitBreakerConfig) {
+        await StateManager.incrementCircuitBreakerFailures(stepId);
+        const circuitState = await StateManager.getCircuitBreakerState(stepId);
+        if (circuitState.failures >= this.circuitBreakerConfig.failureThreshold) {
+          await StateManager.openCircuitBreaker(stepId, this.circuitBreakerConfig.resetTimeout);
+        }
+      }
+
+      // Try error handlers first
+      if (this.errorHandlers) {
+        const errorType = error.constructor.name;
+        const handler = this.errorHandlers[errorType] || this.errorHandlers.default;
+        
+        if (handler) {
+          try {
+            const result = await handler(error, context);
+            await StateManager.updateStep(context.executionId, stepId, 'completed', result);
+            return result;
+          } catch (handlerError) {
+            // Error handler failed, continue to catch handler or re-throw
+            error = handlerError;
+          }
+        }
+      }
+
+      // Try catch handler
+      if (this.catchHandler) {
+        try {
+          const result = await this.catchHandler(error, context);
+          await StateManager.updateStep(context.executionId, stepId, 'completed', result);
+          return result;
+        } catch (catchError) {
+          error = catchError;
+        }
+      }
+
+      // Handle retry logic
+      const maxRetries = 3;
+      const currentAttempt = state.attempt || 1;
+      
+      if (currentAttempt < maxRetries) {
+        // Increment attempt counter and retry
+        await StateManager.incrementAttempt(context.executionId);
+        await StateManager.updateStep(context.executionId, stepId, 'retrying', null, error);
+        
+        // Log retry attempt
+        console.warn(`Step "${stepId}" failed on attempt ${currentAttempt}, retrying...`, error.message);
+        
+        // Re-throw error to trigger retry by engine
+        throw error;
+      }
+      
+      // Max retries exceeded - mark step as permanently failed
+      await StateManager.updateStep(context.executionId, stepId, 'failed', null, error);
+      
+      // Log final failure
+      console.error(`Step "${stepId}" failed permanently after ${maxRetries} attempts:`, error);
+      
+      // Re-throw to fail the entire workflow
+      throw error;
+    }
+  }
+
+  private errorHandlers?: ErrorHandlerMap<T>;
+  private catchHandler?: ErrorHandler<T>;
+  private circuitBreakerConfig?: {
+    failureThreshold: number;
+    resetTimeout: number;
+    onOpen: (ctx: WorkflowContext) => Promise<void>;
+  };
+}
+
 export const createContext = (workflowName: string, executionId: string, input?: any): WorkflowContext => {
   const state = StateManager.load(executionId);
   
-  return {
+  const context: WorkflowContext = {
     workflowName,
     executionId,
     input,
     attempt: state.attempt || 1,
     
-    step: async <T>(stepId: string, handler: () => Promise<T>): Promise<T> => {
-      // Check if step already completed
-      const existingResult = state.steps[stepId];
-      if (existingResult?.status === 'completed') {
-        return existingResult.result as T;
-      }
-      
-      try {
-        // Mark step as running
-        await StateManager.updateStep(executionId, stepId, 'running');
-        
-        // Execute step
-        const result = await handler();
-        
-        // Mark step as completed
-        await StateManager.updateStep(executionId, stepId, 'completed', result);
-        
-        return result;
-      } catch (error) {
-        // Handle retry logic
-        const maxRetries = 3;
-        const currentAttempt = state.attempt || 1;
-        
-        if (currentAttempt < maxRetries) {
-          // Increment attempt counter and retry
-          await StateManager.incrementAttempt(executionId);
-          await StateManager.updateStep(executionId, stepId, 'retrying', null, error);
-          
-          // Log retry attempt
-          console.warn(`Step "${stepId}" failed on attempt ${currentAttempt}, retrying...`, error.message);
-          
-          // Re-throw error to trigger retry by engine
-          throw error;
-        }
-        
-        // Max retries exceeded - mark step as permanently failed
-        await StateManager.updateStep(executionId, stepId, 'failed', null, error);
-        
-        // Log final failure
-        console.error(`Step "${stepId}" failed permanently after ${maxRetries} attempts:`, error);
-        
-        // Re-throw to fail the entire workflow
-        throw error;
-      }
+    step: <T>(stepId: string, handler: () => Promise<T>): StepBuilder<T> => {
+      return new StepBuilder(stepId, handler, context);
     },
     
     sleep: async (stepId: string, ms: number): Promise<void> => {
@@ -1113,12 +1640,24 @@ export const createContext = (workflowName: string, executionId: string, input?:
       throw new SleepInterrupt(wakeTime);
     }
   };
+
+  return context;
+};
+```
+        await StateManager.updateStep(executionId, stepId, 'completed');
+        await WorkflowEngine.resume(executionId);
+      }, ms);
+      
+      // Pause execution
+      throw new SleepInterrupt(wakeTime);
+    }
+  };
 };
 ```
 
 ### 2. Type Definitions
 
-**Core Types (@workflow/types)**
+**Core Types (@workflow/types) with Error Handling**
 ```typescript
 // packages/types/src/workflow.ts
 import { z } from 'zod';
@@ -1176,11 +1715,36 @@ export const PanicConfigSchema = z.object({
   enableAutoRestart: z.boolean()
 });
 
+// Error handling types
+export const CircuitBreakerConfigSchema = z.object({
+  failureThreshold: z.number().int().min(1),
+  resetTimeout: z.number().int().min(1000),
+  onOpen: z.function().args(z.any()).returns(z.promise(z.void()))
+});
+
+export const ErrorHandlerSchema = z.function()
+  .args(z.instanceof(Error), z.any())
+  .returns(z.promise(z.any()));
+
 // TypeScript types inferred from Zod schemas
 export interface WorkflowDefinition extends z.infer<typeof WorkflowDefinitionSchema> {}
 
+// Error handler types
+export type ErrorHandler<T> = (error: Error, ctx: WorkflowContext) => Promise<T>;
+export type ErrorHandlerMap<T> = Record<string, ErrorHandler<T>> & { default?: ErrorHandler<T> };
+
+export interface CircuitBreakerConfig extends z.infer<typeof CircuitBreakerConfigSchema> {}
+
+// Step builder interface
+export interface StepBuilder<T> {
+  onError(handlers: ErrorHandlerMap<T>): StepBuilder<T>;
+  catch(handler: ErrorHandler<T>): StepBuilder<T>;
+  withCircuitBreaker(config: CircuitBreakerConfig): StepBuilder<T>;
+  execute(): Promise<T>;
+}
+
 export interface WorkflowContext extends z.infer<typeof WorkflowContextSchema> {
-  step<T>(stepId: string, handler: () => Promise<T>): Promise<T>;
+  step<T>(stepId: string, handler: () => Promise<T>): StepBuilder<T>;
   sleep(stepId: string, ms: number): Promise<void>;
 }
 
@@ -1195,6 +1759,14 @@ export type StepStatus = z.infer<typeof StepStatusSchema>;
 export interface RetryConfig extends z.infer<typeof RetryConfigSchema> {}
 
 export interface PanicConfig extends z.infer<typeof PanicConfigSchema> {}
+
+// Circuit breaker state
+export interface CircuitBreakerState {
+  isOpen: boolean;
+  failures: number;
+  lastFailureTime?: number;
+  resetTime?: number;
+}
 
 // packages/types/src/common.ts
 import { z } from 'zod';
@@ -1417,6 +1989,154 @@ export namespace WorkflowEngine {
   
   export const getStatus = async (executionId: string): Promise<ExecutionResult> => {
     return await StateManager.getExecutionResult(executionId);
+  };
+}
+```
+
+**StateManager Extensions for Circuit Breaker Support**
+```typescript
+// packages/core/src/state.ts - Circuit Breaker Extensions
+import type { CircuitBreakerState } from '@workflow/types';
+
+export namespace StateManager {
+  // ... existing StateManager methods ...
+
+  // Circuit breaker state management
+  export const getCircuitBreakerState = async (stepId: string): Promise<CircuitBreakerState> => {
+    const db = DatabaseConnection.getConnection();
+    const result = await db.query(
+      'SELECT * FROM circuit_breaker_state WHERE step_id = ?',
+      [stepId]
+    );
+    
+    if (result.length === 0) {
+      return { isOpen: false, failures: 0 };
+    }
+    
+    const state = result[0];
+    const now = Date.now();
+    
+    // Check if circuit should be reset
+    if (state.is_open && state.reset_time && now >= state.reset_time) {
+      await resetCircuitBreaker(stepId);
+      return { isOpen: false, failures: 0 };
+    }
+    
+    return {
+      isOpen: state.is_open,
+      failures: state.failures,
+      lastFailureTime: state.last_failure_time,
+      resetTime: state.reset_time
+    };
+  };
+
+  export const incrementCircuitBreakerFailures = async (stepId: string): Promise<void> => {
+    const db = DatabaseConnection.getConnection();
+    const now = Date.now();
+    
+    await db.query(`
+      INSERT INTO circuit_breaker_state (step_id, failures, last_failure_time, is_open)
+      VALUES (?, 1, ?, false)
+      ON CONFLICT(step_id) DO UPDATE SET
+        failures = failures + 1,
+        last_failure_time = ?
+    `, [stepId, now, now]);
+  };
+
+  export const openCircuitBreaker = async (stepId: string, resetTimeoutMs: number): Promise<void> => {
+    const db = DatabaseConnection.getConnection();
+    const now = Date.now();
+    const resetTime = now + resetTimeoutMs;
+    
+    await db.query(`
+      UPDATE circuit_breaker_state 
+      SET is_open = true, reset_time = ?
+      WHERE step_id = ?
+    `, [resetTime, stepId]);
+  };
+
+  export const resetCircuitBreaker = async (stepId: string): Promise<void> => {
+    const db = DatabaseConnection.getConnection();
+    
+    await db.query(`
+      UPDATE circuit_breaker_state 
+      SET is_open = false, failures = 0, reset_time = NULL
+      WHERE step_id = ?
+    `, [stepId]);
+  };
+
+  // Database schema for circuit breaker state
+  export const createCircuitBreakerTable = async (): Promise<void> => {
+    const db = DatabaseConnection.getConnection();
+    
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS circuit_breaker_state (
+        step_id TEXT PRIMARY KEY,
+        failures INTEGER DEFAULT 0,
+        is_open BOOLEAN DEFAULT false,
+        last_failure_time INTEGER,
+        reset_time INTEGER
+      )
+    `);
+  };
+
+  // Helper functions for error handling
+  export const logStepError = async (
+    executionId: string,
+    stepId: string,
+    error: Error,
+    attempt: number
+  ): Promise<void> => {
+    const db = DatabaseConnection.getConnection();
+    
+    await db.query(`
+      INSERT INTO step_errors (execution_id, step_id, error_message, error_stack, attempt, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `, [executionId, stepId, error.message, error.stack, attempt, Date.now()]);
+  };
+
+  export const getStepErrorHistory = async (
+    executionId: string,
+    stepId: string
+  ): Promise<Array<{
+    errorMessage: string;
+    errorStack: string;
+    attempt: number;
+    timestamp: number;
+  }>> => {
+    const db = DatabaseConnection.getConnection();
+    
+    const results = await db.query(`
+      SELECT error_message, error_stack, attempt, timestamp
+      FROM step_errors
+      WHERE execution_id = ? AND step_id = ?
+      ORDER BY timestamp DESC
+    `, [executionId, stepId]);
+    
+    return results.map(row => ({
+      errorMessage: row.error_message,
+      errorStack: row.error_stack,
+      attempt: row.attempt,
+      timestamp: row.timestamp
+    }));
+  };
+
+  // Database schema for error logging
+  export const createErrorLogTable = async (): Promise<void> => {
+    const db = DatabaseConnection.getConnection();
+    
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS step_errors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        execution_id TEXT NOT NULL,
+        step_id TEXT NOT NULL,
+        error_message TEXT NOT NULL,
+        error_stack TEXT,
+        attempt INTEGER NOT NULL,
+        timestamp INTEGER NOT NULL,
+        INDEX idx_execution_step (execution_id, step_id)
+      )
+    `);
   };
 }
 ```
