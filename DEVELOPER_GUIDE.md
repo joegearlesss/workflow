@@ -297,19 +297,31 @@ await Workflow.start("my-workflow", "execution-id-123");
 ```typescript
 import { Workflow } from '@workflow/core';
 
-// Define custom error types
-class ValidationError extends Error {
-    constructor(message: string, public field: string) {
-        super(message);
-        this.name = 'ValidationError';
-    }
+// Define custom error types using functional approach
+namespace ValidationError {
+    export const create = (message: string, field: string): Error & { field: string } => {
+        const error = new Error(message) as Error & { field: string };
+        error.name = 'ValidationError';
+        error.field = field;
+        return error;
+    };
+    
+    export const is = (error: unknown): error is Error & { field: string } => {
+        return error instanceof Error && error.name === 'ValidationError' && 'field' in error;
+    };
 }
 
-class NetworkError extends Error {
-    constructor(message: string, public statusCode: number) {
-        super(message);
-        this.name = 'NetworkError';
-    }
+namespace NetworkError {
+    export const create = (message: string, statusCode: number): Error & { statusCode: number } => {
+        const error = new Error(message) as Error & { statusCode: number };
+        error.name = 'NetworkError';
+        error.statusCode = statusCode;
+        return error;
+    };
+    
+    export const is = (error: unknown): error is Error & { statusCode: number } => {
+        return error instanceof Error && error.name === 'NetworkError' && 'statusCode' in error;
+    };
 }
 
 // Define a workflow with error handling pipes
@@ -318,14 +330,14 @@ Workflow.define("error-handling-workflow", async (ctx) => {
     await ctx.step("data-processing", async () => {
         const data = await fetchExternalData();
         if (!data.isValid) {
-            throw new ValidationError("Invalid data format", "payload");
+            throw ValidationError.create("Invalid data format", "payload");
         }
         return { processedData: data };
     }).onError({
         ValidationError: async (error, ctx) => {
             // Handle validation errors by running data correction
             await ctx.step("data-correction", async () => {
-                console.log(`Correcting field: ${error.field}`);
+                console.log(`Correcting field: ${ValidationError.is(error) ? error.field : 'unknown'}`);
                 return { corrected: true };
             }).execute();
             // Continue with corrected data
@@ -333,7 +345,7 @@ Workflow.define("error-handling-workflow", async (ctx) => {
         },
         NetworkError: async (error, ctx) => {
             // Handle network errors with exponential backoff
-            if (error.statusCode >= 500) {
+            if (NetworkError.is(error) && error.statusCode >= 500) {
                 await ctx.sleep("network-retry-delay", 5000);
                 throw error; // Retry the original step
             }
@@ -489,7 +501,7 @@ async function fetchExternalData() {
     // Simulate external API call
     const success = Math.random() > 0.3;
     if (!success) {
-        throw new NetworkError("Network timeout", 503);
+        throw NetworkError.create("Network timeout", 503);
     }
     return { isValid: Math.random() > 0.2, data: "sample-data" };
 }
@@ -782,7 +794,7 @@ export namespace Workflow {
     const validation = WorkflowDefinitionSchema.safeParse(definitionData);
     
     if (!validation.success) {
-      throw new ValidationError(
+      throw ValidationError.create(
         `Invalid workflow definition for "${name}"`,
         validation.error
       );
@@ -803,7 +815,7 @@ export namespace Workflow {
     const validation = WorkflowInputSchema.safeParse(inputData);
     
     if (!validation.success) {
-      throw new ValidationError(
+      throw ValidationError.create(
         `Invalid workflow start parameters`,
         validation.error
       );
@@ -822,7 +834,7 @@ export namespace Workflow {
     // Validate execution ID format
     const validation = z.string().uuid().safeParse(executionId);
     if (!validation.success) {
-      throw new ValidationError(
+      throw ValidationError.create(
         `Invalid execution ID format: ${executionId}`,
         validation.error
       );
@@ -835,7 +847,7 @@ export namespace Workflow {
     // Validate execution ID format
     const validation = z.string().uuid().safeParse(executionId);
     if (!validation.success) {
-      throw new ValidationError(
+      throw ValidationError.create(
         `Invalid execution ID format: ${executionId}`,
         validation.error
       );
@@ -848,7 +860,7 @@ export namespace Workflow {
     // Validate execution ID format
     const validation = z.string().uuid().safeParse(executionId);
     if (!validation.success) {
-      throw new ValidationError(
+      throw ValidationError.create(
         `Invalid execution ID format: ${executionId}`,
         validation.error
       );
@@ -869,39 +881,77 @@ import { StateManager } from './state';
 type ErrorHandler<T> = (error: Error, ctx: WorkflowContext) => Promise<T>;
 type ErrorHandlerMap<T> = Record<string, ErrorHandler<T>> & { default?: ErrorHandler<T> };
 
-// Step builder with error handling capabilities
-class StepBuilder<T> {
-  constructor(
-    private stepId: string,
-    private handler: () => Promise<T>,
-    private context: WorkflowContext
-  ) {}
-
-  // Error pipe for specific error types
-  onError(handlers: ErrorHandlerMap<T>): StepBuilder<T> {
-    this.errorHandlers = handlers;
-    return this;
+// Step builder with error handling capabilities using functional approach
+namespace StepBuilder {
+  export interface Config<T> {
+    stepId: string;
+    handler: () => Promise<T>;
+    context: WorkflowContext;
+    errorHandlers?: ErrorHandlerMap<T>;
+    catchHandler?: ErrorHandler<T>;
+    circuitBreakerConfig?: {
+      failureThreshold: number;
+      resetTimeout: number;
+      onOpen: (ctx: WorkflowContext) => Promise<void>;
+    };
   }
 
-  // Catch-all error handler
-  catch(handler: ErrorHandler<T>): StepBuilder<T> {
-    this.catchHandler = handler;
-    return this;
-  }
+  export const create = <T>(
+    stepId: string,
+    handler: () => Promise<T>,
+    context: WorkflowContext
+  ): StepBuilderAPI<T> => {
+    const config: Config<T> = { stepId, handler, context };
+    
+    return {
+      onError: (handlers: ErrorHandlerMap<T>) => {
+        config.errorHandlers = handlers;
+        return createAPI(config);
+      },
+      
+      catch: (handler: ErrorHandler<T>) => {
+        config.catchHandler = handler;
+        return createAPI(config);
+      },
+      
+      withCircuitBreaker: (circuitConfig: {
+        failureThreshold: number;
+        resetTimeout: number;
+        onOpen: (ctx: WorkflowContext) => Promise<void>;
+      }) => {
+        config.circuitBreakerConfig = circuitConfig;
+        return createAPI(config);
+      },
+      
+      execute: () => execute(config)
+    };
+  };
 
-  // Circuit breaker pattern
-  withCircuitBreaker(config: {
-    failureThreshold: number;
-    resetTimeout: number;
-    onOpen: (ctx: WorkflowContext) => Promise<void>;
-  }): StepBuilder<T> {
-    this.circuitBreakerConfig = config;
-    return this;
-  }
+  const createAPI = <T>(config: Config<T>): StepBuilderAPI<T> => ({
+    onError: (handlers: ErrorHandlerMap<T>) => {
+      config.errorHandlers = handlers;
+      return createAPI(config);
+    },
+    
+    catch: (handler: ErrorHandler<T>) => {
+      config.catchHandler = handler;
+      return createAPI(config);
+    },
+    
+    withCircuitBreaker: (circuitConfig: {
+      failureThreshold: number;
+      resetTimeout: number;
+      onOpen: (ctx: WorkflowContext) => Promise<void>;
+    }) => {
+      config.circuitBreakerConfig = circuitConfig;
+      return createAPI(config);
+    },
+    
+    execute: () => execute(config)
+  });
 
-  // Execute the step with error handling
-  async execute(): Promise<T> {
-    const { stepId, handler, context } = this;
+  const execute = async <T>(config: Config<T>): Promise<T> => {
+    const { stepId, handler, context } = config;
     const state = StateManager.load(context.executionId);
     
     // Check if step already completed
@@ -911,10 +961,10 @@ class StepBuilder<T> {
     }
 
     // Check circuit breaker state
-    if (this.circuitBreakerConfig) {
+    if (config.circuitBreakerConfig) {
       const circuitState = await StateManager.getCircuitBreakerState(stepId);
       if (circuitState.isOpen) {
-        await this.circuitBreakerConfig.onOpen(context);
+        await config.circuitBreakerConfig.onOpen(context);
         return;
       }
     }
@@ -927,7 +977,7 @@ class StepBuilder<T> {
       const result = await handler();
       
       // Reset circuit breaker on success
-      if (this.circuitBreakerConfig) {
+      if (config.circuitBreakerConfig) {
         await StateManager.resetCircuitBreaker(stepId);
       }
       
@@ -938,18 +988,18 @@ class StepBuilder<T> {
       
     } catch (error) {
       // Update circuit breaker failure count
-      if (this.circuitBreakerConfig) {
+      if (config.circuitBreakerConfig) {
         await StateManager.incrementCircuitBreakerFailures(stepId);
         const circuitState = await StateManager.getCircuitBreakerState(stepId);
-        if (circuitState.failures >= this.circuitBreakerConfig.failureThreshold) {
-          await StateManager.openCircuitBreaker(stepId, this.circuitBreakerConfig.resetTimeout);
+        if (circuitState.failures >= config.circuitBreakerConfig.failureThreshold) {
+          await StateManager.openCircuitBreaker(stepId, config.circuitBreakerConfig.resetTimeout);
         }
       }
 
       // Try error handlers first
-      if (this.errorHandlers) {
+      if (config.errorHandlers) {
         const errorType = error.constructor.name;
-        const handler = this.errorHandlers[errorType] || this.errorHandlers.default;
+        const handler = config.errorHandlers[errorType] || config.errorHandlers.default;
         
         if (handler) {
           try {
@@ -964,9 +1014,9 @@ class StepBuilder<T> {
       }
 
       // Try catch handler
-      if (this.catchHandler) {
+      if (config.catchHandler) {
         try {
-          const result = await this.catchHandler(error, context);
+          const result = await config.catchHandler(error, context);
           await StateManager.updateStep(context.executionId, stepId, 'completed', result);
           return result;
         } catch (catchError) {
@@ -999,15 +1049,18 @@ class StepBuilder<T> {
       // Re-throw to fail the entire workflow
       throw error;
     }
-  }
-
-  private errorHandlers?: ErrorHandlerMap<T>;
-  private catchHandler?: ErrorHandler<T>;
-  private circuitBreakerConfig?: {
-    failureThreshold: number;
-    resetTimeout: number;
-    onOpen: (ctx: WorkflowContext) => Promise<void>;
   };
+
+  export interface StepBuilderAPI<T> {
+    onError(handlers: ErrorHandlerMap<T>): StepBuilderAPI<T>;
+    catch(handler: ErrorHandler<T>): StepBuilderAPI<T>;
+    withCircuitBreaker(config: {
+      failureThreshold: number;
+      resetTimeout: number;
+      onOpen: (ctx: WorkflowContext) => Promise<void>;
+    }): StepBuilderAPI<T>;
+    execute(): Promise<T>;
+  }
 }
 
 export const createContext = (workflowName: string, executionId: string, input?: Record<string, unknown>): WorkflowContext => {
@@ -1019,8 +1072,8 @@ export const createContext = (workflowName: string, executionId: string, input?:
     input,
     attempt: state.attempt || 1,
     
-    step: <T>(stepId: string, handler: () => Promise<T>): StepBuilder<T> => {
-      return new StepBuilder(stepId, handler, context);
+    step: <T>(stepId: string, handler: () => Promise<T>): StepBuilder.StepBuilderAPI<T> => {
+      return StepBuilder.create(stepId, handler, context);
     },
     
     sleep: async (stepId: string, ms: number): Promise<void> => {
@@ -1053,7 +1106,7 @@ export const createContext = (workflowName: string, executionId: string, input?:
       }, ms);
       
       // Pause execution
-      throw new SleepInterrupt(wakeTime);
+      throw SleepInterrupt.create(wakeTime);
     }
   };
 };
@@ -1148,7 +1201,7 @@ export interface StepBuilder<T> {
 }
 
 export interface WorkflowContext extends z.infer<typeof WorkflowContextSchema> {
-  step<T>(stepId: string, handler: () => Promise<T>): StepBuilder<T>;
+  step<T>(stepId: string, handler: () => Promise<T>): StepBuilder.StepBuilderAPI<T>;
   sleep(stepId: string, ms: number): Promise<void>;
 }
 
@@ -1187,45 +1240,73 @@ export const WorkflowInputSchema = z.object({
   panicConfig: PanicConfigSchema.optional()
 });
 
-export class SleepInterrupt extends Error {
-  constructor(public readonly wakeTime: number) {
-    super('Workflow sleeping');
-    this.name = 'SleepInterrupt';
-  }
+export namespace SleepInterrupt {
+  export const create = (wakeTime: number): Error & { wakeTime: number } => {
+    const error = new Error('Workflow sleeping') as Error & { wakeTime: number };
+    error.name = 'SleepInterrupt';
+    error.wakeTime = wakeTime;
+    return error;
+  };
+  
+  export const is = (error: unknown): error is Error & { wakeTime: number } => {
+    return error instanceof Error && error.name === 'SleepInterrupt' && 'wakeTime' in error;
+  };
 }
 
-export class WorkflowError extends Error {
-  constructor(
+export namespace WorkflowError {
+  export const create = (
     message: string,
-    public readonly stepId: string,
-    public readonly attempt: number,
-    public readonly originalError?: Error
-  ) {
-    super(message);
-    this.name = 'WorkflowError';
-  }
+    stepId: string,
+    attempt: number,
+    originalError?: Error
+  ): Error & { stepId: string; attempt: number; originalError?: Error } => {
+    const error = new Error(message) as Error & { stepId: string; attempt: number; originalError?: Error };
+    error.name = 'WorkflowError';
+    error.stepId = stepId;
+    error.attempt = attempt;
+    error.originalError = originalError;
+    return error;
+  };
+  
+  export const is = (error: unknown): error is Error & { stepId: string; attempt: number; originalError?: Error } => {
+    return error instanceof Error && error.name === 'WorkflowError' && 'stepId' in error && 'attempt' in error;
+  };
 }
 
-export class PanicError extends Error {
-  constructor(
+export namespace PanicError {
+  export const create = (
     message: string,
-    public readonly stepId: string,
-    public readonly attempt: number,
-    public readonly originalError?: Error
-  ) {
-    super(message);
-    this.name = 'PanicError';
-  }
+    stepId: string,
+    attempt: number,
+    originalError?: Error
+  ): Error & { stepId: string; attempt: number; originalError?: Error } => {
+    const error = new Error(message) as Error & { stepId: string; attempt: number; originalError?: Error };
+    error.name = 'PanicError';
+    error.stepId = stepId;
+    error.attempt = attempt;
+    error.originalError = originalError;
+    return error;
+  };
+  
+  export const is = (error: unknown): error is Error & { stepId: string; attempt: number; originalError?: Error } => {
+    return error instanceof Error && error.name === 'PanicError' && 'stepId' in error && 'attempt' in error;
+  };
 }
 
-export class ValidationError extends Error {
-  constructor(
+export namespace ValidationError {
+  export const create = (
     message: string,
-    public readonly validationErrors: z.ZodError
-  ) {
-    super(message);
-    this.name = 'ValidationError';
-  }
+    validationErrors: z.ZodError
+  ): Error & { validationErrors: z.ZodError } => {
+    const error = new Error(message) as Error & { validationErrors: z.ZodError };
+    error.name = 'ValidationError';
+    error.validationErrors = validationErrors;
+    return error;
+  };
+  
+  export const is = (error: unknown): error is Error & { validationErrors: z.ZodError } => {
+    return error instanceof Error && error.name === 'ValidationError' && 'validationErrors' in error;
+  };
 }
 ```
 ### 4. Error Handling and Recovery
@@ -1257,13 +1338,13 @@ export namespace WorkflowEngine {
       return await StateManager.getExecutionResult(executionId);
       
     } catch (error) {
-      if (error instanceof SleepInterrupt) {
+      if (SleepInterrupt.is(error)) {
         // Workflow is sleeping - this is expected
         await StateManager.updateExecution(executionId, 'sleeping');
         return await StateManager.getExecutionResult(executionId);
       }
       
-      if (error instanceof PanicError) {
+      if (PanicError.is(error)) {
         // Workflow panicked - mark for restart
         await StateManager.updateExecution(executionId, 'panicked', error);
         
@@ -1281,14 +1362,14 @@ export namespace WorkflowEngine {
         throw error;
       }
       
-      if (error instanceof WorkflowError) {
+      if (WorkflowError.is(error)) {
         // Workflow step failed permanently
         await StateManager.updateExecution(executionId, 'failed', error);
         throw error;
       }
       
       // Unexpected error - treat as panic
-      const panicError = new PanicError(
+      const panicError = PanicError.create(
         `Workflow execution panicked: ${error.message}`,
         'unknown',
         context.attempt,
@@ -1321,7 +1402,7 @@ export namespace WorkflowEngine {
     } catch (error) {
       // Check if this is a critical system error that should trigger panic
       if (isSystemPanic(error)) {
-        throw new PanicError(
+        throw PanicError.create(
           `System panic detected: ${error.message}`,
           'system',
           context.attempt,
@@ -1563,7 +1644,7 @@ export const createContext = (
   const contextValidation = WorkflowContextSchema.safeParse(contextData);
   
   if (!contextValidation.success) {
-    throw new ValidationError(
+    throw ValidationError.create(
       `Invalid workflow context`,
       contextValidation.error
     );
@@ -1573,7 +1654,7 @@ export const createContext = (
   if (retryConfig) {
     const retryValidation = RetryConfigSchema.safeParse(retryConfig);
     if (!retryValidation.success) {
-      throw new ValidationError(
+      throw ValidationError.create(
         `Invalid retry configuration`,
         retryValidation.error
       );
@@ -1584,7 +1665,7 @@ export const createContext = (
   if (panicConfig) {
     const panicValidation = PanicConfigSchema.safeParse(panicConfig);
     if (!panicValidation.success) {
-      throw new ValidationError(
+      throw ValidationError.create(
         `Invalid panic configuration`,
         panicValidation.error
       );
@@ -1616,7 +1697,7 @@ export const createContext = (
       // Validate step ID
       const stepIdValidation = z.string().min(1, 'Step ID cannot be empty').safeParse(stepId);
       if (!stepIdValidation.success) {
-        throw new ValidationError(
+        throw ValidationError.create(
           `Invalid step ID: ${stepId}`,
           stepIdValidation.error
         );
@@ -1649,7 +1730,7 @@ export const createContext = (
           // Check if this is a panic-level error
           if (isPanicError(lastError)) {
             await StateManager.updateStep(executionId, stepId, 'failed', null, lastError, attempt);
-            throw new PanicError(
+            throw PanicError.create(
               `Step "${stepId}" caused system panic: ${lastError.message}`,
               stepId,
               attempt,
@@ -1679,7 +1760,7 @@ export const createContext = (
       // All retries exhausted
       await StateManager.updateStep(executionId, stepId, 'failed', null, lastError, retryConf.maxAttempts);
       
-      const workflowError = new WorkflowError(
+      const workflowError = WorkflowError.create(
         `Step "${stepId}" failed after ${retryConf.maxAttempts} attempts: ${lastError!.message}`,
         stepId,
         retryConf.maxAttempts,
@@ -1697,7 +1778,7 @@ export const createContext = (
       }).safeParse({ stepId, ms });
 
       if (!sleepValidation.success) {
-        throw new ValidationError(
+        throw ValidationError.create(
           `Invalid sleep parameters`,
           sleepValidation.error
         );
@@ -1720,7 +1801,7 @@ export const createContext = (
       }, ms);
       
       // Pause execution
-      throw new SleepInterrupt(wakeTime);
+      throw SleepInterrupt.create(wakeTime);
     }
   };
 };
@@ -1737,7 +1818,7 @@ const executeStepWithValidation = async <T>(
     try {
       JSON.stringify(result);
     } catch (serializationError) {
-      throw new ValidationError(
+      throw ValidationError.create(
         `Step "${stepId}" returned non-serializable result`,
         new z.ZodError([{
           code: 'custom',
@@ -1751,7 +1832,7 @@ const executeStepWithValidation = async <T>(
   } catch (error) {
     // Enhanced panic detection
     if (isPanicError(error)) {
-      throw new PanicError(
+      throw PanicError.create(
         `Panic detected in step "${stepId}": ${error.message}`,
         stepId,
         attempt,
