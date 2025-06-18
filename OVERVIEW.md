@@ -44,10 +44,8 @@ The project is organized as a single publishable library:
 - **@workflow/database**: SQLite persistence for workflow state
 - **@workflow/utils**: Utility functions and helpers
 
-### Development Apps (`apps/`)
-- **server**: Development server for testing workflows
-- **cli**: Command-line tool for workflow management
-- **dashboard**: Web interface for monitoring workflow executions
+### Development Tools (`apps/`)
+- **cli**: Command-line tool for debugging workflows, database access, and execution monitoring
 
 ## Step-by-Step Implementation Guide
 
@@ -76,10 +74,10 @@ The project is organized as a single publishable library:
 4. Set up CI/CD for automated publishing
 
 ### Phase 5: Development Tools
-1. Build development server for testing workflows
-2. Create CLI for workflow management and debugging
-3. Develop dashboard for execution monitoring
-4. Add development utilities and helpers
+1. Create CLI for workflow debugging and database access
+2. Add execution monitoring and log viewing capabilities
+3. Build state inspection and error analysis tools
+4. Add cleanup utilities for old executions
 
 ## Key Features
 
@@ -176,7 +174,7 @@ await Workflow.start("email-notification", crypto.randomUUID(), {
 
 ## Benefits
 
-- **Easy Integration**: Simple npm install and import in any TypeScript project
+- **Easy Integration**: Simple npm install and import in any TypeScript/Bun project
 - **Maintainable**: Functional programming reduces complexity
 - **Reliable**: Bun's SQLite client provides ACID transactions
 - **Resilient**: Automatic panic detection and restart capabilities
@@ -185,3 +183,4 @@ await Workflow.start("email-notification", crypto.randomUUID(), {
 - **Type-Safe**: TypeScript prevents runtime errors
 - **Developer Friendly**: Intuitive fluent API with great IDE support
 - **Production Ready**: Built-in error handling, retry logic, panic recovery, and state persistence
+- **Debug-Friendly**: CLI tool for inspecting workflow state, logs, and execution history

@@ -53,7 +53,7 @@ bun install
 
 # Create workspace structure
 mkdir -p packages/{core,database,types,utils}
-mkdir -p apps/{server,cli,dashboard}
+mkdir -p apps/{cli}
 mkdir -p tests/{unit,integration,e2e}
 
 # Install shared dependencies at root
@@ -125,40 +125,8 @@ EOF
 │       │   ├── validation.ts    # Validation helpers
 │       │   └── validation.test.ts # Unit tests for validation
 │       └── package.json
-├── apps/                        # Development applications
-│   ├── server/                  # Development server
-│   │   ├── src/
-│   │   │   ├── index.ts         # Main server entry point
-│   │   │   ├── routes/          # API route handlers
-│   │   │   │   ├── workflows.ts # Workflow management endpoints
-│   │   │   │   ├── executions.ts # Execution monitoring endpoints
-│   │   │   │   └── health.ts    # Health check endpoints
-│   │   │   ├── middleware/      # Express middleware
-│   │   │   │   ├── auth.ts      # Authentication middleware
-│   │   │   │   ├── cors.ts      # CORS configuration
-│   │   │   │   └── logging.ts   # Request logging
-│   │   │   ├── services/        # Business logic services
-│   │   │   │   ├── workflow-service.ts # Workflow operations
-│   │   │   │   └── execution-service.ts # Execution management
-│   │   │   ├── config/          # Server configuration
-│   │   │   │   ├── database.ts  # Database connection config
-│   │   │   │   └── server.ts    # Server settings
-│   │   │   └── types/           # Server-specific types
-│   │   │       └── api.ts       # API request/response types
-│   │   ├── package.json         # Server dependencies
-│   │   ├── tsconfig.json        # TypeScript config
-│   │   └── tests/               # Server tests
-│   │       ├── integration/     # Integration tests
-│   │       │   ├── workflows.test.ts
-│   │       │   └── executions.test.ts
-│   │       └── unit/            # Unit tests
-│   │           ├── services.test.ts
-│   │           └── middleware.test.ts
-│   ├── cli/                     # CLI tool for testing
-│   │   ├── src/
-│   │   │   ├── index.ts
-│   │   │   └── index.test.ts    # CLI tests
-│   └── cli/                     # CLI tool for workflow management
+├── apps/                        # Development tools
+│   └── cli/                     # CLI tool for debugging workflows
 │       ├── src/
 │       │   ├── index.ts         # CLI entry point
 │       │   ├── commands/        # CLI commands
@@ -166,9 +134,12 @@ EOF
 │       │   │   ├── create.ts    # Create workflow command
 │       │   │   ├── start.ts     # Start execution command
 │       │   │   ├── status.ts    # Check execution status
+│       │   │   ├── logs.ts      # View execution logs
+│       │   │   ├── inspect.ts   # Inspect workflow state
 │       │   │   └── cleanup.ts   # Cleanup old executions
 │       │   └── utils/           # CLI utilities
 │       │       ├── output.ts    # Output formatting
+│       │       ├── database.ts  # Database inspection tools
 │       │       └── config.ts    # CLI configuration
 │       └── tests/
 │           └── commands.test.ts # CLI command tests
