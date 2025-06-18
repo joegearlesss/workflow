@@ -84,6 +84,7 @@ The project is organized as a single publishable library:
 
 - **Fluent API**: Simple, chainable workflow definition syntax
 - **Automatic Retry**: Built-in retry logic with configurable attempts
+- **Panic Recovery**: Automatic restart after system-level failures
 - **Resumable Execution**: Workflows can be paused and resumed
 - **State Persistence**: Reliable state storage with Bun's SQLite client
 - **Error Recovery**: Automatic error handling and recovery
@@ -95,7 +96,7 @@ The project is organized as a single publishable library:
 ```typescript
 import { Workflow } from '@workflow/core';
 
-// Define a complex workflow with error handling
+// Define a complex workflow with error handling and panic recovery
 Workflow.define("email-notification", async (ctx) => {
     // Step 1: Validate input data
     const userData = await ctx.step("validate-input", async () => {
@@ -109,11 +110,18 @@ Workflow.define("email-notification", async (ctx) => {
     // Step 2: Wait before processing (demonstrating sleep)
     await ctx.sleep("processing-delay", 1000);
 
-    // Step 3: Send email with retry logic
+    // Step 3: Send email with retry logic and panic detection
     await ctx.step("send-email", async () => {
+        // Simulate system panic on first restart attempt
+        if (ctx.restartAttempt === 1 && ctx.attempt < 2) {
+            throw new Error("out of memory - system panic");
+        }
+        
+        // Simulate normal retry logic
         if (ctx.attempt < 2) {
             throw new Error("Simulated email service error");
         }
+        
         console.log(`Sending email to ${userData.email}`);
         return { emailId: "email-123", status: "sent" };
     });
@@ -121,13 +129,22 @@ Workflow.define("email-notification", async (ctx) => {
     // Step 4: Log success
     await ctx.step("log-success", async () => {
         console.log("Email notification workflow completed successfully");
+        console.log(`Completed after ${ctx.restartAttempt} restart(s) and ${ctx.attempt} attempt(s)`);
     });
 });
 
-// Start the workflow with input data
+// Start the workflow with input data and panic recovery configuration
 await Workflow.start("email-notification", "user-signup-123", {
     email: "user@example.com",
     name: "John Doe"
+}, {
+    maxAttempts: 3,
+    backoffMs: 1000,
+    exponentialBackoff: true
+}, {
+    maxRestartAttempts: 2,
+    restartDelayMs: 3000,
+    enableAutoRestart: true
 });
 ```
 
@@ -136,7 +153,8 @@ await Workflow.start("email-notification", "user-signup-123", {
 - **Easy Integration**: Simple npm install and import in any TypeScript project
 - **Maintainable**: Functional programming reduces complexity
 - **Reliable**: Bun's SQLite client provides ACID transactions
+- **Resilient**: Automatic panic detection and restart capabilities
 - **Fast**: Bun runtime offers excellent performance
 - **Type-Safe**: TypeScript prevents runtime errors
 - **Developer Friendly**: Intuitive fluent API with great IDE support
-- **Production Ready**: Built-in error handling, retry logic, and state persistence
+- **Production Ready**: Built-in error handling, retry logic, panic recovery, and state persistence

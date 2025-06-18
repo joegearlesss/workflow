@@ -89,17 +89,24 @@ EOF
 │   ├── core/                    # Main workflow library
 │   │   ├── src/
 │   │   │   ├── workflow.ts      # Main Workflow class with fluent API
+│   │   │   ├── workflow.test.ts # Unit tests for workflow
 │   │   │   ├── context.ts       # WorkflowContext implementation
+│   │   │   ├── context.test.ts  # Unit tests for context
 │   │   │   ├── engine.ts        # Execution engine
+│   │   │   ├── engine.test.ts   # Unit tests for engine
 │   │   │   ├── state.ts         # State management
+│   │   │   ├── state.test.ts    # Unit tests for state
 │   │   │   └── index.ts         # Public exports
 │   │   ├── package.json         # Publishable package
 │   │   └── tsconfig.json
 │   ├── database/                # SQLite persistence
 │   │   ├── src/
 │   │   │   ├── schema.ts        # Database schema
+│   │   │   ├── schema.test.ts   # Unit tests for schema
 │   │   │   ├── repository.ts    # Data access layer
-│   │   │   └── connection.ts    # Connection management
+│   │   │   ├── repository.test.ts # Unit tests for repository
+│   │   │   ├── connection.ts    # Connection management
+│   │   │   └── connection.test.ts # Unit tests for connection
 │   │   └── package.json
 │   ├── types/                   # TypeScript definitions
 │   │   ├── src/
@@ -110,16 +117,28 @@ EOF
 │   └── utils/                   # Utility functions
 │       ├── src/
 │       │   ├── logger.ts        # Logging utilities
-│       │   └── validation.ts    # Validation helpers
+│       │   ├── logger.test.ts   # Unit tests for logger
+│       │   ├── validation.ts    # Validation helpers
+│       │   └── validation.test.ts # Unit tests for validation
 │       └── package.json
 ├── apps/                        # Development applications
 │   ├── server/                  # Development server
+│   │   ├── src/
+│   │   │   ├── index.ts
+│   │   │   └── index.test.ts    # Integration tests
 │   ├── cli/                     # CLI tool for testing
+│   │   ├── src/
+│   │   │   ├── index.ts
+│   │   │   └── index.test.ts    # CLI tests
 │   └── dashboard/               # Web dashboard
-└── tests/                       # Test suites
-    ├── unit/                    # Unit tests
-    ├── integration/             # Integration tests
+│       ├── src/
+│       │   ├── index.ts
+│       │   └── index.test.ts    # Dashboard tests
+└── tests/                       # End-to-end test suites
     └── e2e/                     # End-to-end tests
+        ├── workflow-execution.test.ts
+        ├── panic-recovery.test.ts
+        └── integration.test.ts
 ```
 
 ## Development Guidelines
@@ -260,6 +279,7 @@ export interface WorkflowContext {
   readonly executionId: string;
   readonly input?: any;
   readonly attempt: number;
+  readonly restartAttempt: number;
   
   step<T>(stepId: string, handler: () => Promise<T>): Promise<T>;
   sleep(stepId: string, ms: number): Promise<void>;
@@ -272,9 +292,10 @@ export interface ExecutionResult {
   readonly completedAt?: Date;
   readonly error?: Error;
   readonly steps: Record<string, StepResult>;
+  readonly restartAttempt: number;
 }
 
-export type ExecutionStatus = 'running' | 'completed' | 'failed' | 'sleeping';
+export type ExecutionStatus = 'running' | 'completed' | 'failed' | 'sleeping' | 'panicked' | 'restarting';
 
 export interface StepResult {
   readonly stepId: string;
@@ -311,19 +332,37 @@ export class WorkflowError extends Error {
   }
 }
 
+export class PanicError extends Error {
+  constructor(
+    message: string,
+    public readonly stepId: string,
+    public readonly attempt: number,
+    public readonly originalError?: Error
+  ) {
+    super(message);
+    this.name = 'PanicError';
+  }
+}
+
 export interface RetryConfig {
   readonly maxAttempts: number;
   readonly backoffMs?: number;
   readonly exponentialBackoff?: boolean;
 }
+
+export interface PanicConfig {
+  readonly maxRestartAttempts: number;
+  readonly restartDelayMs: number;
+  readonly enableAutoRestart: boolean;
+}
 ```
 ### 4. Error Handling and Recovery
 
-**Workflow Engine with Error Handling**
+**Workflow Engine with Error Handling and Panic Recovery**
 ```typescript
 // packages/core/src/engine.ts
 import type { WorkflowDefinition, WorkflowContext, ExecutionResult } from '@workflow/types';
-import { WorkflowError, SleepInterrupt } from '@workflow/types';
+import { WorkflowError, SleepInterrupt, PanicError } from '@workflow/types';
 import { StateManager } from './state';
 
 export namespace WorkflowEngine {
@@ -337,8 +376,8 @@ export namespace WorkflowEngine {
       // Mark workflow as running
       await StateManager.updateExecution(executionId, 'running');
       
-      // Execute workflow handler
-      await definition.handler(context);
+      // Execute workflow handler with panic recovery
+      await executeWithPanicRecovery(definition, context);
       
       // Mark workflow as completed
       await StateManager.updateExecution(executionId, 'completed');
@@ -352,23 +391,115 @@ export namespace WorkflowEngine {
         return await StateManager.getExecutionResult(executionId);
       }
       
+      if (error instanceof PanicError) {
+        // Workflow panicked - mark for restart
+        await StateManager.updateExecution(executionId, 'panicked', error);
+        
+        // Schedule automatic restart after panic recovery delay
+        setTimeout(async () => {
+          try {
+            console.warn(`Restarting workflow ${executionId} after panic: ${error.message}`);
+            await restart(executionId);
+          } catch (restartError) {
+            console.error(`Failed to restart workflow ${executionId}:`, restartError);
+            await StateManager.updateExecution(executionId, 'failed', restartError);
+          }
+        }, 5000); // 5 second delay before restart
+        
+        throw error;
+      }
+      
       if (error instanceof WorkflowError) {
         // Workflow step failed permanently
         await StateManager.updateExecution(executionId, 'failed', error);
         throw error;
       }
       
-      // Unexpected error
-      const workflowError = new WorkflowError(
-        `Workflow execution failed: ${error.message}`,
+      // Unexpected error - treat as panic
+      const panicError = new PanicError(
+        `Workflow execution panicked: ${error.message}`,
         'unknown',
         context.attempt,
         error instanceof Error ? error : new Error(String(error))
       );
       
-      await StateManager.updateExecution(executionId, 'failed', workflowError);
-      throw workflowError;
+      await StateManager.updateExecution(executionId, 'panicked', panicError);
+      
+      // Schedule automatic restart
+      setTimeout(async () => {
+        try {
+          console.warn(`Restarting workflow ${executionId} after unexpected panic`);
+          await restart(executionId);
+        } catch (restartError) {
+          console.error(`Failed to restart workflow ${executionId}:`, restartError);
+          await StateManager.updateExecution(executionId, 'failed', restartError);
+        }
+      }, 5000);
+      
+      throw panicError;
     }
+  };
+  
+  const executeWithPanicRecovery = async (
+    definition: WorkflowDefinition,
+    context: WorkflowContext
+  ): Promise<void> => {
+    try {
+      await definition.handler(context);
+    } catch (error) {
+      // Check if this is a critical system error that should trigger panic
+      if (isSystemPanic(error)) {
+        throw new PanicError(
+          `System panic detected: ${error.message}`,
+          'system',
+          context.attempt,
+          error instanceof Error ? error : new Error(String(error))
+        );
+      }
+      
+      // Re-throw other errors normally
+      throw error;
+    }
+  };
+  
+  const isSystemPanic = (error: any): boolean => {
+    // Detect system-level panics that require restart
+    const panicIndicators = [
+      'out of memory',
+      'stack overflow',
+      'segmentation fault',
+      'process killed',
+      'system error',
+      'fatal error',
+      'unhandled promise rejection',
+      'uncaught exception'
+    ];
+    
+    const errorMessage = error?.message?.toLowerCase() || '';
+    return panicIndicators.some(indicator => errorMessage.includes(indicator));
+  };
+  
+  export const restart = async (executionId: string): Promise<ExecutionResult> => {
+    const state = await StateManager.load(executionId);
+    if (!state) {
+      throw new Error(`Execution ${executionId} not found`);
+    }
+    
+    if (state.status !== 'panicked') {
+      throw new Error(`Cannot restart execution ${executionId} with status ${state.status}`);
+    }
+    
+    // Reset panic state and increment restart attempt
+    await StateManager.incrementRestartAttempt(executionId);
+    await StateManager.updateExecution(executionId, 'restarting');
+    
+    // Recreate context with fresh state
+    const context = await StateManager.recreateContext(executionId);
+    const definition = await StateManager.getWorkflowDefinition(state.workflowName);
+    
+    console.log(`Restarting workflow ${executionId} (attempt ${context.restartAttempt})`);
+    
+    return await execute(definition, context);
   };
   
   export const resume = async (executionId: string): Promise<ExecutionResult> => {
@@ -394,14 +525,15 @@ export namespace WorkflowEngine {
 }
 ```
 
-**Enhanced Context with Configurable Retry**
+**Enhanced Context with Configurable Retry and Panic Recovery**
 ```typescript
 // packages/core/src/context.ts - Enhanced version
 export const createContext = (
   workflowName: string, 
   executionId: string, 
   input?: any,
-  retryConfig?: RetryConfig
+  retryConfig?: RetryConfig,
+  panicConfig?: PanicConfig
 ): WorkflowContext => {
   const state = StateManager.load(executionId);
   const defaultRetryConfig: RetryConfig = {
@@ -409,13 +541,20 @@ export const createContext = (
     backoffMs: 1000,
     exponentialBackoff: true
   };
-  const config = { ...defaultRetryConfig, ...retryConfig };
+  const defaultPanicConfig: PanicConfig = {
+    maxRestartAttempts: 3,
+    restartDelayMs: 5000,
+    enableAutoRestart: true
+  };
+  const retryConf = { ...defaultRetryConfig, ...retryConfig };
+  const panicConf = { ...defaultPanicConfig, ...panicConfig };
   
   return {
     workflowName,
     executionId,
     input,
     attempt: state.attempt || 1,
+    restartAttempt: state.restartAttempt || 1,
     
     step: async <T>(stepId: string, handler: () => Promise<T>): Promise<T> => {
       // Check if step already completed
@@ -426,13 +565,13 @@ export const createContext = (
       
       let lastError: Error | null = null;
       
-      for (let attempt = 1; attempt <= config.maxAttempts; attempt++) {
+      for (let attempt = 1; attempt <= retryConf.maxAttempts; attempt++) {
         try {
           // Mark step as running
           await StateManager.updateStep(executionId, stepId, 'running', null, null, attempt);
           
-          // Execute step
-          const result = await handler();
+          // Execute step with panic detection
+          const result = await executeStepWithPanicDetection(handler, stepId, attempt);
           
           // Mark step as completed
           await StateManager.updateStep(executionId, stepId, 'completed', result);
@@ -442,16 +581,27 @@ export const createContext = (
         } catch (error) {
           lastError = error instanceof Error ? error : new Error(String(error));
           
-          if (attempt < config.maxAttempts) {
+          // Check if this is a panic-level error
+          if (isPanicError(lastError)) {
+            await StateManager.updateStep(executionId, stepId, 'failed', null, lastError, attempt);
+            throw new PanicError(
+              `Step "${stepId}" caused system panic: ${lastError.message}`,
+              stepId,
+              attempt,
+              lastError
+            );
+          }
+          
+          if (attempt < retryConf.maxAttempts) {
             // Calculate backoff delay
-            const backoffMs = config.exponentialBackoff 
-              ? config.backoffMs! * Math.pow(2, attempt - 1)
-              : config.backoffMs!;
+            const backoffMs = retryConf.exponentialBackoff 
+              ? retryConf.backoffMs! * Math.pow(2, attempt - 1)
+              : retryConf.backoffMs!;
             
             // Mark step as retrying
             await StateManager.updateStep(executionId, stepId, 'retrying', null, lastError, attempt);
             
-            console.warn(`Step "${stepId}" failed on attempt ${attempt}/${config.maxAttempts}, retrying in ${backoffMs}ms...`, lastError.message);
+            console.warn(`Step "${stepId}" failed on attempt ${attempt}/${retryConf.maxAttempts}, retrying in ${backoffMs}ms...`, lastError.message);
             
             // Wait before retry
             if (backoffMs > 0) {
@@ -462,20 +612,83 @@ export const createContext = (
       }
       
       // All retries exhausted
-      await StateManager.updateStep(executionId, stepId, 'failed', null, lastError, config.maxAttempts);
+      await StateManager.updateStep(executionId, stepId, 'failed', null, lastError, retryConf.maxAttempts);
       
       const workflowError = new WorkflowError(
-        `Step "${stepId}" failed after ${config.maxAttempts} attempts: ${lastError!.message}`,
+        `Step "${stepId}" failed after ${retryConf.maxAttempts} attempts: ${lastError!.message}`,
         stepId,
-        config.maxAttempts,
+        retryConf.maxAttempts,
         lastError!
       );
       
       throw workflowError;
     },
     
-    // ... sleep implementation remains the same
+    sleep: async (stepId: string, ms: number): Promise<void> => {
+      // Check if sleep already completed
+      const existingResult = state.steps[stepId];
+      if (existingResult?.status === 'completed') {
+        return;
+      }
+      
+      // Store sleep end time
+      const wakeTime = Date.now() + ms;
+      await StateManager.updateStep(executionId, stepId, 'sleeping', { wakeTime });
+      
+      // Schedule resume
+      setTimeout(async () => {
+        await StateManager.updateStep(executionId, stepId, 'completed');
+        await WorkflowEngine.resume(executionId);
+      }, ms);
+      
+      // Pause execution
+      throw new SleepInterrupt(wakeTime);
+    }
   };
+};
+
+const executeStepWithPanicDetection = async <T>(
+  handler: () => Promise<T>,
+  stepId: string,
+  attempt: number
+): Promise<T> => {
+  try {
+    return await handler();
+  } catch (error) {
+    // Enhanced panic detection
+    if (isPanicError(error)) {
+      throw new PanicError(
+        `Panic detected in step "${stepId}": ${error.message}`,
+        stepId,
+        attempt,
+        error instanceof Error ? error : new Error(String(error))
+      );
+    }
+    throw error;
+  }
+};
+
+const isPanicError = (error: any): boolean => {
+  const panicIndicators = [
+    'out of memory',
+    'stack overflow',
+    'segmentation fault',
+    'process killed',
+    'system error',
+    'fatal error',
+    'unhandled promise rejection',
+    'uncaught exception',
+    'maximum call stack',
+    'heap out of memory',
+    'cannot allocate memory'
+  ];
+  
+  const errorMessage = error?.message?.toLowerCase() || '';
+  const errorStack = error?.stack?.toLowerCase() || '';
+  
+  return panicIndicators.some(indicator => 
+    errorMessage.includes(indicator) || errorStack.includes(indicator)
+  );
 };
 ```
 
@@ -1052,8 +1265,8 @@ export namespace StepExecutor {
 {
   "scripts": {
     "test": "bun test",
-    "test:unit": "bun test tests/unit",
-    "test:integration": "bun test tests/integration",
+    "test:unit": "bun test **/*.test.ts",
+    "test:e2e": "bun test tests/e2e",
     "test:packages": "bun --filter='packages/*' test",
     "test:apps": "bun --filter='apps/*' test",
     "typecheck": "bun tsc --noEmit",
@@ -1062,39 +1275,236 @@ export namespace StepExecutor {
 }
 ```
 
-**Package-Specific Tests**
+**Co-located Unit Tests**
 ```typescript
-// packages/core/tests/engine.test.ts
-import { describe, test, expect } from 'bun:test';
-import { WorkflowEngine } from '../src/engine';
-import type { Workflow } from '@workflow/types';
+// packages/core/src/engine.test.ts
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { WorkflowEngine } from './engine';
+import { PanicError, WorkflowError } from '@workflow/types';
+import { StateManager } from './state';
 
 describe('WorkflowEngine', () => {
-  test('should create workflow instance from definition', () => {
-    const definition: Workflow.Definition = {
-      id: 'test-workflow',
-      name: 'Test Workflow',
-      steps: []
+  beforeEach(async () => {
+    // Setup test database
+    await StateManager.initialize(':memory:');
+  });
+
+  afterEach(async () => {
+    // Cleanup
+    await StateManager.close();
+  });
+
+  test('should execute workflow successfully', async () => {
+    const definition = {
+      name: 'test-workflow',
+      handler: async (ctx) => {
+        await ctx.step('step1', async () => 'result1');
+      }
     };
 
-    const result = WorkflowEngine.create(definition);
+    const context = {
+      workflowName: 'test-workflow',
+      executionId: 'test-exec-1',
+      attempt: 1,
+      restartAttempt: 1,
+      step: async (id, handler) => handler(),
+      sleep: async () => {}
+    };
+
+    const result = await WorkflowEngine.execute(definition, context);
     
-    expect(result.success).toBe(true);
-    if (result.success) {
-      expect(result.data.definition).toEqual(definition);
-    }
+    expect(result.status).toBe('completed');
+    expect(result.executionId).toBe('test-exec-1');
+  });
+
+  test('should handle panic errors and schedule restart', async () => {
+    const definition = {
+      name: 'panic-workflow',
+      handler: async (ctx) => {
+        throw new Error('out of memory');
+      }
+    };
+
+    const context = {
+      workflowName: 'panic-workflow',
+      executionId: 'panic-exec-1',
+      attempt: 1,
+      restartAttempt: 1,
+      step: async (id, handler) => handler(),
+      sleep: async () => {}
+    };
+
+    await expect(WorkflowEngine.execute(definition, context))
+      .rejects.toThrow(PanicError);
+  });
+
+  test('should restart panicked workflow', async () => {
+    // First, create a panicked execution
+    await StateManager.updateExecution('restart-test', 'panicked');
+    
+    const result = await WorkflowEngine.restart('restart-test');
+    
+    expect(result.status).toBe('restarting');
   });
 });
 ```
 
-**Integration Tests**
+**Context Unit Tests**
 ```typescript
-// tests/integration/workflow-execution.test.ts
+// packages/core/src/context.test.ts
+import { describe, test, expect, beforeEach } from 'bun:test';
+import { createContext } from './context';
+import { PanicError, WorkflowError } from '@workflow/types';
+
+describe('WorkflowContext', () => {
+  test('should execute step successfully', async () => {
+    const context = createContext('test-workflow', 'test-exec', {});
+    
+    const result = await context.step('test-step', async () => {
+      return 'step-result';
+    });
+    
+    expect(result).toBe('step-result');
+  });
+
+  test('should detect panic errors', async () => {
+    const context = createContext('panic-workflow', 'panic-exec', {});
+    
+    await expect(context.step('panic-step', async () => {
+      throw new Error('out of memory');
+    })).rejects.toThrow(PanicError);
+  });
+
+  test('should retry failed steps', async () => {
+    let attempts = 0;
+    const context = createContext('retry-workflow', 'retry-exec', {}, {
+      maxAttempts: 3,
+      backoffMs: 10
+    });
+    
+    const result = await context.step('retry-step', async () => {
+      attempts++;
+      if (attempts < 3) {
+        throw new Error('temporary failure');
+      }
+      return 'success';
+    });
+    
+    expect(result).toBe('success');
+    expect(attempts).toBe(3);
+  });
+
+  test('should throw WorkflowError after max retries', async () => {
+    const context = createContext('fail-workflow', 'fail-exec', {}, {
+      maxAttempts: 2,
+      backoffMs: 10
+    });
+    
+    await expect(context.step('fail-step', async () => {
+      throw new Error('persistent failure');
+    })).rejects.toThrow(WorkflowError);
+  });
+});
+```
+
+**Database Repository Tests**
+```typescript
+// packages/database/src/repository.test.ts
+import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { Database } from 'bun:sqlite';
+import { WorkflowRepository, ExecutionRepository } from './repository';
+import { Schema } from './schema';
+
+describe('WorkflowRepository', () => {
+  let db: Database;
+
+  beforeEach(() => {
+    db = new Database(':memory:');
+    Schema.createTables(db);
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  test('should save and retrieve workflow', async () => {
+    const workflow = {
+      definition: {
+        id: 'test-workflow',
+        name: 'Test Workflow',
+        steps: []
+      },
+      createdAt: new Date(),
+      version: 1
+    };
+
+    const saveResult = await WorkflowRepository.save(db, workflow);
+    expect(saveResult.success).toBe(true);
+
+    const findResult = await WorkflowRepository.findById(db, 'test-workflow');
+    expect(findResult.success).toBe(true);
+    expect(findResult.data?.definition.name).toBe('Test Workflow');
+  });
+
+  test('should handle database errors gracefully', async () => {
+    db.close(); // Force database error
+
+    const workflow = {
+      definition: { id: 'test', name: 'Test', steps: [] },
+      createdAt: new Date(),
+      version: 1
+    };
+
+    const result = await WorkflowRepository.save(db, workflow);
+    expect(result.success).toBe(false);
+    expect(result.error).toBeInstanceOf(Error);
+  });
+});
+
+describe('ExecutionRepository', () => {
+  let db: Database;
+
+  beforeEach(() => {
+    db = new Database(':memory:');
+    Schema.createTables(db);
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  test('should create and update execution', async () => {
+    const execution = {
+      workflowId: 'test-workflow',
+      status: 'running' as const,
+      startedAt: new Date(),
+      restartAttempt: 1
+    };
+
+    const createResult = await ExecutionRepository.create(db, execution);
+    expect(createResult.success).toBe(true);
+
+    const executionId = createResult.data!;
+    const updatedExecution = {
+      ...execution,
+      status: 'completed' as const,
+      completedAt: new Date()
+    };
+
+    const updateResult = await ExecutionRepository.update(db, executionId, updatedExecution);
+    expect(updateResult.success).toBe(true);
+  });
+});
+```
+
+**End-to-End Integration Tests**
+```typescript
+// tests/e2e/workflow-execution.test.ts
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { WorkflowEngine } from '@workflow/core';
+import { Workflow } from '@workflow/core';
 import { DatabaseConnection } from '@workflow/database';
 
-describe('Workflow Execution Integration', () => {
+describe('Workflow Execution E2E', () => {
   beforeAll(async () => {
     DatabaseConnection.initialize(':memory:');
   });
@@ -1103,12 +1513,110 @@ describe('Workflow Execution Integration', () => {
     DatabaseConnection.close();
   });
 
-  test('should execute complete workflow', async () => {
-    const workflow = await setupTestWorkflow();
-    const execution = await WorkflowEngine.execute(workflow);
+  test('should execute complete workflow with steps and sleep', async () => {
+    let stepResults: string[] = [];
+
+    Workflow.define('e2e-test-workflow', async (ctx) => {
+      await ctx.step('step1', async () => {
+        stepResults.push('step1');
+        return 'result1';
+      });
+
+      await ctx.sleep('wait', 100);
+
+      await ctx.step('step2', async () => {
+        stepResults.push('step2');
+        return 'result2';
+      });
+    });
+
+    const result = await Workflow.start('e2e-test-workflow', 'e2e-exec-1');
     
-    expect(execution.status).toBe('completed');
-    expect(execution.steps).toHaveLength(3);
+    expect(result.status).toBe('completed');
+    expect(stepResults).toEqual(['step1', 'step2']);
+  });
+
+  test('should handle workflow with retries', async () => {
+    let attempts = 0;
+
+    Workflow.define('retry-test-workflow', async (ctx) => {
+      await ctx.step('retry-step', async () => {
+        attempts++;
+        if (attempts < 3) {
+          throw new Error('temporary failure');
+        }
+        return 'success';
+      });
+    });
+
+    const result = await Workflow.start('retry-test-workflow', 'retry-exec-1');
+    
+    expect(result.status).toBe('completed');
+    expect(attempts).toBe(3);
+  });
+});
+```
+
+**Panic Recovery E2E Tests**
+```typescript
+// tests/e2e/panic-recovery.test.ts
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { Workflow } from '@workflow/core';
+import { DatabaseConnection } from '@workflow/database';
+import { PanicError } from '@workflow/types';
+
+describe('Panic Recovery E2E', () => {
+  beforeAll(async () => {
+    DatabaseConnection.initialize(':memory:');
+  });
+
+  afterAll(async () => {
+    DatabaseConnection.close();
+  });
+
+  test('should detect and handle system panic', async () => {
+    Workflow.define('panic-test-workflow', async (ctx) => {
+      await ctx.step('panic-step', async () => {
+        throw new Error('out of memory');
+      });
+    });
+
+    await expect(Workflow.start('panic-test-workflow', 'panic-exec-1'))
+      .rejects.toThrow(PanicError);
+
+    const status = await Workflow.getStatus('panic-exec-1');
+    expect(status.status).toBe('panicked');
+  });
+
+  test('should restart after panic with state preservation', async () => {
+    let restartAttempts = 0;
+
+    Workflow.define('restart-test-workflow', async (ctx) => {
+      await ctx.step('pre-panic', async () => {
+        return 'completed-before-panic';
+      });
+
+      await ctx.step('panic-step', async () => {
+        restartAttempts = ctx.restartAttempt;
+        if (ctx.restartAttempt < 2) {
+          throw new Error('system error');
+        }
+        return 'recovered';
+      });
+    });
+
+    // This will panic and auto-restart
+    try {
+      await Workflow.start('restart-test-workflow', 'restart-exec-1');
+    } catch (error) {
+      // Expected panic
+    }
+
+    // Wait for auto-restart
+    await new Promise(resolve => setTimeout(resolve, 6000));
+
+    const status = await Workflow.getStatus('restart-exec-1');
+    expect(status.restartAttempt).toBeGreaterThan(1);
   });
 });
 ```
@@ -1205,14 +1713,53 @@ await Workflow.start("resilient-task", "task-456", null, {
 });
 ```
 
-### Error Recovery and Monitoring
+### Workflow with Panic Recovery
 ```typescript
-// Monitor workflow execution
+Workflow.define("panic-resilient-task", async (ctx) => {
+    await ctx.step("risky-operation", async () => {
+        // Simulate a system-level panic
+        if (ctx.restartAttempt < 2) {
+            throw new Error("out of memory - system panic");
+        }
+        return "Success after restart";
+    });
+    
+    await ctx.step("normal-operation", async () => {
+        console.log("Normal operation completed");
+    });
+});
+
+// Start with panic recovery configuration
+await Workflow.start("panic-resilient-task", "task-789", null, {
+    maxAttempts: 3,
+    backoffMs: 1000,
+    exponentialBackoff: true
+}, {
+    maxRestartAttempts: 3,
+    restartDelayMs: 5000,
+    enableAutoRestart: true
+});
+```
+
+### Error Recovery and Monitoring with Panic Handling
+```typescript
+// Monitor workflow execution with panic detection
 try {
     const result = await Workflow.start("my-workflow", "exec-123");
     console.log("Workflow completed:", result);
 } catch (error) {
-    if (error instanceof WorkflowError) {
+    if (error instanceof PanicError) {
+        console.error(`Workflow panicked at step "${error.stepId}" on attempt ${error.attempt}:`, error.originalError);
+        
+        // Get detailed execution status
+        const status = await Workflow.getStatus("exec-123");
+        console.log("Workflow status:", status.status);
+        console.log("Restart attempt:", status.restartAttempt);
+        
+        if (status.status === 'panicked') {
+            console.log("Workflow will automatically restart in 5 seconds...");
+        }
+    } else if (error instanceof WorkflowError) {
         console.error(`Workflow failed at step "${error.stepId}" after ${error.attempt} attempts:`, error.originalError);
         
         // Get detailed execution status
@@ -1224,8 +1771,14 @@ try {
     }
 }
 
-// Resume a sleeping workflow
+// Manual restart of panicked workflow
 const status = await Workflow.getStatus("exec-123");
+if (status.status === 'panicked') {
+    console.log("Manually restarting panicked workflow...");
+    await Workflow.restart("exec-123");
+}
+
+// Resume a sleeping workflow
 if (status.status === 'sleeping') {
     console.log("Resuming sleeping workflow...");
     await Workflow.resume("exec-123");
