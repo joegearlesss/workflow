@@ -1,186 +1,347 @@
 # Workflow Library Overview
 
-## Architecture
+A TypeScript workflow orchestration library built with **functional programming principles** and **Bun runtime**. Enables reliable, resumable, and observable workflow execution with comprehensive error handling and state management.
 
-The workflow library is built as a standalone TypeScript package that provides:
-- **Fluent API** for defining workflows with steps, sleep, and error handling
-- **TypeScript** for type safety and development experience
-- **Zod** for runtime schema validation and type inference
-- **Bun** as the runtime and package manager
-- **Functional Programming** with namespaces (no classes)
-- **Bun SQLite** for persistent state and execution tracking
+## 🎯 Purpose
 
-## Library Usage
+The workflow library provides:
+- **Step-by-step execution** with automatic state persistence
+- **Error handling pipes** for conditional flow control  
+- **Circuit breaker patterns** for external service resilience
+- **Sleep/delay capabilities** for time-based orchestration
+- **Resumable workflows** that survive application restarts
+- **Observable execution** with detailed logging and metrics
 
-The workflow library provides a simple, fluent API for defining and executing workflows:
+## 🏗️ Architecture
+
+Built using **TypeScript namespaces**, **functional programming**, and **chain patterns**:
 
 ```typescript
-import { Workflow } from '@workflow/core';
+// ✅ Functional namespace approach
+namespace Workflow {
+  export const define = (name: string, handler: WorkflowHandler): void => { /* ... */ };
+  export const start = (name: string, executionId: string): Promise<void> => { /* ... */ };
+}
 
-// Define a workflow
-Workflow.define("test", async (ctx) => {
-    await ctx.step("one", async () => console.log("hey there!"));
-    await ctx.sleep("two", 2000);
-    await ctx.step("three", async () => {
-        if (ctx.attempt < 3) throw new Error("this is a test error");
-    });
-    await ctx.step("four", async () => console.log("done"));
+// ✅ No classes - pure functions with fluent chaining
+namespace WorkflowContext {
+  export const step = (name: string, fn: StepFunction): StepBuilder => { /* ... */ };
+  export const sleep = (name: string, durationMs: number): Promise<void> => { /* ... */ };
+}
+
+// ✅ Chain pattern for class-like fluent APIs
+const stepBuilder = ctx.step("process-data", async () => { /* ... */ })
+  .onError({ NetworkError: async (error, ctx) => { /* ... */ } })
+  .withCircuitBreaker({ failureThreshold: 3 })
+  .execute();
+```
+
+## 🚀 Core Features
+
+### Workflow Definition & Execution
+```typescript
+// Define reusable workflow templates
+Workflow.define("data-processing", async (ctx) => {
+  const data = await ctx.step("fetch-data", async () => {
+    return await fetchExternalData();
+  });
+  
+  await ctx.sleep("processing-delay", 2000);
+  
+  await ctx.step("process-data", async () => {
+    return processData(data);
+  });
 });
 
 // Start workflow execution
-await Workflow.start("test", "first-run");
+await Workflow.start("data-processing", "exec-123");
 ```
 
-## Package Structure
-
-The project is organized as a single publishable library:
-
-### Core Package (`packages/core/`)
-- **@workflow/core**: Main workflow library with fluent API
-- Exports: `Workflow`, `WorkflowContext`, types
-
-### Supporting Packages
-- **@workflow/types**: TypeScript definitions for workflows and steps
-- **@workflow/database**: SQLite persistence for workflow state
-- **@workflow/utils**: Utility functions and helpers
-
-### Development Tools (`apps/`)
-- **cli**: Command-line tool for debugging workflows, database access, and execution monitoring
-
-## Step-by-Step Implementation Guide
-
-### Phase 1: Core Library Setup
-1. Initialize Bun workspace with root package.json
-2. Create core library package structure
-3. Set up TypeScript configuration with Bun types
-4. Configure package exports for library consumption
-
-### Phase 2: Workflow Context and API
-1. Create WorkflowContext with step, sleep, and retry functionality
-2. Implement Workflow.define() for workflow registration
-3. Build Workflow.start() for execution initiation
-4. Add state persistence with SQLite
-
-### Phase 3: Step Execution Engine
-1. Implement step execution with automatic retry logic
-2. Add sleep functionality with resumable state
-3. Build error handling and recovery mechanisms
-4. Create execution tracking and logging
-
-### Phase 4: Library Publishing
-1. Configure package.json for npm publishing
-2. Build TypeScript declarations
-3. Create comprehensive documentation and examples
-4. Set up CI/CD for automated publishing
-
-### Phase 5: Development Tools
-1. Create CLI for workflow debugging and database access
-2. Add execution monitoring and log viewing capabilities
-3. Build state inspection and error analysis tools
-4. Add cleanup utilities for old executions
-
-## Key Features
-
-- **Fluent API**: Simple, chainable workflow definition syntax
-- **Automatic Retry**: Built-in retry logic with configurable attempts
-- **Panic Recovery**: Automatic restart after system-level failures
-- **Schema Validation**: Runtime validation with Zod for type safety
-- **Resumable Execution**: Workflows can be paused and resumed
-- **State Persistence**: Reliable state storage with Bun's SQLite client
-- **Error Recovery**: Automatic error handling and recovery
-- **Type Safety**: Full TypeScript support throughout
-- **Functional Design**: Pure functions and immutable data structures
-
-## Example Workflow
-
+### Error Handling Pipes
 ```typescript
-import { Workflow } from '@workflow/core';
-import { z } from 'zod';
+// Advanced error handling with typed error flows
+await ctx.step("api-call", async () => {
+  const response = await fetch('/api/data');
+  if (!response.ok) {
+    throw new NetworkError(`API failed: ${response.status}`, response.status);
+  }
+  return response.json();
+}).onError({
+  NetworkError: async (error, ctx) => {
+    // Exponential backoff for network errors
+    await ctx.sleep("retry-delay", 2000 * ctx.attempt);
+    throw error; // Retry the step
+  },
+  ValidationError: async (error, ctx) => {
+    // Use fallback data for validation errors
+    return { fallback: true, data: getDefaultData() };
+  },
+  default: async (error, ctx) => {
+    // Log and alert for unexpected errors
+    await sendAlert(error);
+    throw error;
+  }
+}).execute();
+```
 
-// Define input schema for validation
-const EmailInputSchema = z.object({
-    email: z.string().email('Invalid email format'),
-    name: z.string().min(1, 'Name is required'),
-    templateId: z.string().uuid('Invalid template ID')
-});
-
-// Define a complex workflow with error handling and panic recovery
-Workflow.define("email-notification", async (ctx) => {
-    // Step 1: Validate input data with Zod
-    const userData = await ctx.step("validate-input", async () => {
-        const validation = EmailInputSchema.safeParse(ctx.input);
-        if (!validation.success) {
-            throw new ValidationError(
-                "Invalid input data",
-                validation.error
-            );
-        }
-        return validation.data;
+### Circuit Breaker Pattern
+```typescript
+// Protect against cascading failures
+await ctx.step("external-service", async () => {
+  return await callExternalService();
+}).withCircuitBreaker({
+  failureThreshold: 5,
+  resetTimeout: 60000,
+  onOpen: async (ctx) => {
+    // Fallback when circuit is open
+    await ctx.step("use-cache", async () => {
+      return getCachedData();
     });
+  }
+}).execute();
+```
 
-    // Step 2: Wait before processing (demonstrating sleep)
-    await ctx.sleep("processing-delay", 1000);
+## 📦 Technology Stack
 
-    // Step 3: Send email with retry logic and panic detection
-    await ctx.step("send-email", async () => {
-        // Simulate system panic on first restart attempt
-        if (ctx.restartAttempt === 1 && ctx.attempt < 2) {
-            throw new Error("out of memory - system panic");
-        }
-        
-        // Simulate normal retry logic
-        if (ctx.attempt < 2) {
-            throw new Error("Simulated email service error");
-        }
-        
-        console.log(`Sending email to ${userData.email}`);
-        
-        // Validate response structure
-        const responseSchema = z.object({
-            emailId: z.string().uuid(),
-            status: z.enum(['sent', 'queued', 'failed'])
-        });
-        
-        const response = { 
-            emailId: crypto.randomUUID(), 
-            status: 'sent' as const 
-        };
-        
-        return responseSchema.parse(response);
-    });
+### Core Technologies
+- **Runtime**: Bun (optimized performance)
+- **Language**: TypeScript (strict type safety)
+- **Database**: Drizzle ORM with Bun native SQLite client
+- **Migrations**: Drizzle migrations with SQLite
+- **Schema Validation**: Zod (runtime type checking)
+- **Testing**: Bun test (fast native testing)
+- **Linting**: Biome v2.0.0 (code quality)
 
-    // Step 4: Log success
-    await ctx.step("log-success", async () => {
-        console.log("Email notification workflow completed successfully");
-        console.log(`Completed after ${ctx.restartAttempt} restart(s) and ${ctx.attempt} attempt(s)`);
-    });
-});
+### Architecture Principles
+- **NO CLASSES**: Pure functional programming with namespaces
+- **Chain Pattern**: Function chaining for fluent, class-like APIs without classes
+- **Immutability**: All operations return new state
+- **Type Safety**: Comprehensive TypeScript and Zod validation
+- **Error Transparency**: Explicit error handling with typed flows
 
-// Start the workflow with validated input data and panic recovery configuration
-await Workflow.start("email-notification", crypto.randomUUID(), {
-    email: "user@example.com",
-    name: "John Doe",
-    templateId: crypto.randomUUID()
-}, {
-    maxAttempts: 3,
-    backoffMs: 1000,
-    exponentialBackoff: true
-}, {
-    maxRestartAttempts: 2,
-    restartDelayMs: 3000,
-    enableAutoRestart: true
+## 🔄 Workflow Lifecycle
+
+```
+1. Define → 2. Start → 3. Execute Steps → 4. Handle Errors → 5. Complete/Resume
+    ↑                                                              ↓
+    └─────────────────── Resume from Last Step ←──────────────────┘
+```
+
+### State Persistence
+- **Automatic checkpointing** after each successful step using Drizzle ORM
+- **Resume capability** from any point of failure with SQLite persistence
+- **State isolation** between different workflow executions
+- **Rollback support** for failed transactions
+- **Migration support** for schema evolution with Drizzle migrations
+
+## 🎛️ Error Handling Strategies
+
+### 1. Error Pipes
+Route different error types to specific handling logic:
+```typescript
+.onError({
+  ValidationError: async (error, ctx) => { /* specific handling */ },
+  NetworkError: async (error, ctx) => { /* retry logic */ },
+  default: async (error, ctx) => { /* catch-all */ }
+})
+```
+
+### 2. Circuit Breaker
+Prevent cascading failures with automatic fallback:
+```typescript
+.withCircuitBreaker({
+  failureThreshold: 3,
+  resetTimeout: 30000,
+  onOpen: async (ctx) => { /* fallback logic */ }
+})
+```
+
+### 3. Retry & Backoff
+Built-in exponential backoff for transient failures:
+```typescript
+await Workflow.start("my-workflow", "exec-id", {}, {
+  maxAttempts: 3,
+  backoffMs: 1000,
+  exponentialBackoff: true
 });
 ```
 
-## Benefits
+## 💼 Use Cases
 
-- **Easy Integration**: Simple bun add and import in any TypeScript/Bun project
-- **Maintainable**: Functional programming reduces complexity
-- **Reliable**: Bun's SQLite client provides ACID transactions
-- **Resilient**: Automatic panic detection and restart capabilities
-- **Validated**: Zod schemas ensure runtime type safety and data integrity
-- **Fast**: Bun runtime offers excellent performance
-- **Type-Safe**: TypeScript prevents runtime errors
-- **Developer Friendly**: Intuitive fluent API with great IDE support
-- **Production Ready**: Built-in error handling, retry logic, panic recovery, and state persistence
-- **Debug-Friendly**: CLI tool for inspecting workflow state, logs, and execution history
+### E-commerce Order Processing
+- Payment processing with fallback methods
+- Inventory reservation with conflict resolution
+- Shipping integration with manual fallback
+- Customer notification with retry logic
+
+### Data Pipeline Orchestration
+- Multi-stage data transformation
+- External API integration with circuit breakers
+- Error recovery and data quality checks
+- Progress tracking and monitoring
+
+### Microservice Coordination
+- Service-to-service communication
+- Transaction coordination across services
+- Failure isolation and recovery
+- Distributed workflow execution
+
+## 🧪 Testing Strategy
+
+### Comprehensive Test Coverage Requirements
+
+**MUST CREATE** all four test types for complete coverage:
+
+#### 1. Unit Tests (`.test.ts`)
+- **Location**: Same folder as source file
+- **Purpose**: Test individual functions in isolation
+- **Coverage**: 90% line coverage minimum
+- **Examples**: Function logic, validation, error handling
+
+#### 2. Performance Tests (`.performance.test.ts`)
+- **Location**: Same folder as source file  
+- **Purpose**: Test execution time and memory usage
+- **Requirements**: Functions complete within expected time limits
+- **Examples**: Workflow step execution time, memory leak detection
+
+#### 3. Integration Tests (`tests/integration/`)
+- **Location**: Separate `tests/integration/` folder
+- **Purpose**: Test multiple components working together
+- **Requirements**: Database interactions, workflow orchestration
+- **Examples**: Workflow execution with database persistence, error recovery flows
+
+#### 4. End-to-End Tests (`tests/e2e/`)
+- **Location**: Separate `tests/e2e/` folder
+- **Purpose**: Test complete user journeys and workflows
+- **Requirements**: Full workflow lifecycle testing
+- **Examples**: Complete workflow execution from start to finish, resume scenarios
+
+### Test Commands
+```bash
+# Run all tests
+bun test                           # All test types
+bun test --coverage                # With coverage report
+
+# Run by test type
+bun test "**/*.test.ts"                      # Unit tests only
+bun test "**/*.performance.test.ts"          # Performance tests only
+bun test "**/integration/*.test.ts"          # Integration tests only
+bun test "**/e2e/*.test.ts"                  # E2E tests only
+
+# Watch mode
+bun test --watch                   # Watch all tests
+bun test --watch "**/*.test.ts"    # Watch unit tests only
+```
+
+### Test Structure Requirements
+```
+packages/core/
+├── src/
+│   ├── workflow.ts
+│   ├── workflow.test.ts              # ✅ REQUIRED: Unit tests
+│   ├── workflow.performance.test.ts   # ✅ REQUIRED: Performance tests
+│   ├── context.ts
+│   ├── context.test.ts              # ✅ REQUIRED: Unit tests
+│   └── context.performance.test.ts   # ✅ REQUIRED: Performance tests
+└── tests/
+    ├── integration/                 # ✅ REQUIRED: Integration tests
+    │   ├── workflow-execution.integration.test.ts
+    │   ├── database-persistence.integration.test.ts
+    │   └── error-recovery.integration.test.ts
+    └── e2e/                        # ✅ REQUIRED: E2E tests
+        ├── complete-workflow.e2e.test.ts
+        ├── workflow-resume.e2e.test.ts
+        └── error-scenarios.e2e.test.ts
+```
+
+## 🔧 Development Commands
+
+```bash
+# Setup
+bun install                    # Install dependencies
+
+# Database
+bun run db:generate           # Generate Drizzle migrations
+bun run db:migrate            # Run database migrations
+bun run db:studio             # Launch Drizzle Studio
+
+# Development
+bun run dev                    # Start development server
+bun test --watch              # Watch mode testing
+
+# Quality Assurance
+bun test                      # Run all tests
+bun run biome check          # Lint and format check
+bun run biome format --write # Auto-format code
+bunx tsc --noEmit           # Type checking
+
+# Build
+bun run build               # Production build
+```
+
+## 📚 Package Structure
+
+```
+packages/
+├── core/                  # Core workflow engine
+│   ├── src/
+│   │   ├── workflow.ts
+│   │   ├── context.ts
+│   │   ├── error-handling.ts
+│   │   ├── circuit-breaker.ts
+│   │   └── database/
+│   │       ├── schema.ts      # Drizzle schema definitions
+│   │       ├── migrations/    # Database migrations
+│   │       └── client.ts      # Bun SQLite client setup
+│   └── tests/
+├── components/           # Reusable workflow components
+└── examples/            # Usage examples and templates
+```
+
+## 🎯 Getting Started
+
+1. **Install Dependencies**
+   ```bash
+   bun install
+   ```
+
+2. **Define Your First Workflow**
+   ```typescript
+   import { Workflow } from '@workflow/core';
+   
+   Workflow.define("hello-world", async (ctx) => {
+     await ctx.step("greet", async () => {
+       console.log("Hello, World!");
+       return { greeting: "Hello, World!" };
+     });
+   });
+   ```
+
+3. **Execute the Workflow**
+   ```bash
+   await Workflow.start("hello-world", "my-execution-id");
+   ```
+
+4. **Add Error Handling**
+   ```typescript
+   await ctx.step("api-call", async () => {
+     return await callAPI();
+   }).onError({
+     NetworkError: async (error, ctx) => {
+       return { fallback: true };
+     }
+   }).execute();
+   ```
+
+## 🔍 Key Benefits
+
+- **Reliability**: Automatic state persistence and recovery
+- **Observability**: Detailed execution logging and metrics
+- **Flexibility**: Composable steps with conditional flows
+- **Performance**: Bun runtime optimization
+- **Type Safety**: Full TypeScript coverage with runtime validation
+- **Maintainability**: Functional architecture with clear separation of concerns
+
+---
+
+Built with ❤️ using **TypeScript**, **Bun**, and **functional programming principles**.

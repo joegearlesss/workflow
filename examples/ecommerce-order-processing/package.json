@@ -1,0 +1,28 @@
+{
+  "name": "ecommerce-order-processing-example",
+  "version": "1.0.0",
+  "description": "E-commerce order processing workflow example demonstrating payment, inventory, shipping, and notifications",
+  "type": "module",
+  "scripts": {
+    "start": "bun run main.ts",
+    "test": "bun run test-scenarios.ts",
+    "demo": "bun run main.ts",
+    "scenarios": "bun run test-scenarios.ts"
+  },
+  "keywords": [
+    "workflow",
+    "ecommerce",
+    "order-processing",
+    "payment",
+    "inventory",
+    "shipping",
+    "notifications",
+    "example"
+  ],
+  "dependencies": {
+    "@workflow-engine/core": "workspace:*"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}

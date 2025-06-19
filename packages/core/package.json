@@ -1,0 +1,39 @@
+{
+  "name": "@workflow/core",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./workflow": "./src/workflow.ts",
+    "./context": "./src/context.ts",
+    "./error-handling": "./src/error-handling.ts",
+    "./circuit-breaker": "./src/circuit-breaker.ts",
+    "./database": "./src/database/index.ts",
+    "./database/schema": "./src/database/schema.ts",
+    "./database/client": "./src/database/client.ts"
+  },
+  "scripts": {
+    "dev": "bun --watch src/index.ts",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "test": "bun test",
+    "test:unit": "bun test \"**/*.test.ts\"",
+    "test:performance": "bun test \"**/*.performance.test.ts\"",
+    "test:integration": "bun test \"tests/integration/*.test.ts\"",
+    "test:e2e": "bun test \"tests/e2e/*.test.ts\"",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "db:studio": "drizzle-kit studio"
+  },
+  "dependencies": {
+    "drizzle-orm": "^0.36.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.28.0"
+  },
+  "peerDependencies": {
+    "@types/bun": "*",
+    "typescript": "^5.0.0"
+  }
+}
