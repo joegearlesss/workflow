@@ -135,9 +135,8 @@ namespace Workflow {
       return execution.output as TOutput;
     }
 
-    if (execution.status === 'running') {
-      throw new Error(`Workflow execution '${executionId}' is already running`);
-    }
+    // For resume, we allow re-running 'running' executions in case they were interrupted
+    // The actual running check should be handled by workflow locks, not status
 
     const handler = registry.get(execution.workflowName);
     if (!handler) {

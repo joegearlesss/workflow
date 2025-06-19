@@ -5,7 +5,7 @@ import type { WorkflowHandler } from './types';
 
 describe('Workflow Performance', () => {
   beforeEach(async () => {
-    await DatabaseClient.initialize(':memory:');
+    await Workflow.initialize(':memory:');
   });
 
   afterEach(() => {

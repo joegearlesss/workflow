@@ -8,7 +8,6 @@ import { TestSetup } from '../setup';
 describe('Complete Workflow E2E Tests', () => {
   beforeEach(async () => {
     await TestSetup.createTestDatabase();
-    await Workflow.initialize();
   });
 
   afterEach(() => {

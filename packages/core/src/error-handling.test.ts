@@ -2,10 +2,11 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { ErrorHandling } from './error-handling';
 import { WorkflowContext } from './context';
 import { DatabaseClient } from './database';
+import { Workflow } from './workflow';
 
 describe('ErrorHandling', () => {
   beforeEach(async () => {
-    await DatabaseClient.initialize(':memory:');
+    await Workflow.initialize(':memory:');
   });
 
   afterEach(() => {

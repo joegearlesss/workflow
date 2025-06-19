@@ -1,19 +1,42 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { WorkflowContextImpl } from './context';
-import { DatabaseClient } from './database';
+import { DatabaseClient, Database } from './database';
 import { ErrorHandling } from './error-handling';
+import { Workflow } from './workflow';
 
 describe('WorkflowContext Performance', () => {
   beforeEach(async () => {
-    await DatabaseClient.initialize(':memory:');
+    await Workflow.initialize(':memory:');
   });
 
   afterEach(() => {
     DatabaseClient.close();
   });
 
+  // Helper function to create workflow execution for testing
+  const createTestExecution = async (executionId: string) => {
+    // Create a workflow definition first
+    const definition = await Database.WorkflowDefinition.create({
+      name: `test-workflow-${executionId}`,
+      version: '1.0.0',
+      description: 'Test workflow definition',
+      schema: { steps: [] },
+      isActive: true
+    });
+
+    // Create the workflow execution
+    return Database.WorkflowExecution.create({
+      id: executionId,
+      definitionId: definition.id,
+      workflowName: 'test-workflow',
+      status: 'running',
+      input: {}
+    });
+  };
+
   describe('step execution performance', () => {
     test('should execute simple step within 5ms', async () => {
+      await createTestExecution('exec-perf-1');
       const context = new WorkflowContextImpl('exec-perf-1', 'test-workflow', {}, 1, {});
 
       const start = performance.now();
@@ -27,6 +50,7 @@ describe('WorkflowContext Performance', () => {
     });
 
     test('should handle step caching efficiently', async () => {
+      await createTestExecution('exec-perf-2');
       const context = new WorkflowContextImpl('exec-perf-2', 'test-workflow', {}, 1, {});
 
       // First execution
@@ -46,6 +70,7 @@ describe('WorkflowContext Performance', () => {
     });
 
     test('should execute 20 sequential steps within 100ms', async () => {
+      await createTestExecution('exec-perf-3');
       const context = new WorkflowContextImpl('exec-perf-3', 'test-workflow', {}, 1, {});
 
       const start = performance.now();
@@ -60,6 +85,7 @@ describe('WorkflowContext Performance', () => {
     });
 
     test('should handle step failure efficiently', async () => {
+      await createTestExecution('exec-perf-4');
       const context = new WorkflowContextImpl('exec-perf-4', 'test-workflow', {}, 1, {});
 
       const start = performance.now();
@@ -77,6 +103,7 @@ describe('WorkflowContext Performance', () => {
 
   describe('error handling performance', () => {
     test('should handle error with error handlers within 10ms', async () => {
+      await createTestExecution('exec-perf-5');
       const context = new WorkflowContextImpl('exec-perf-5', 'test-workflow', {}, 1, {});
 
       const start = performance.now();
@@ -94,6 +121,7 @@ describe('WorkflowContext Performance', () => {
     });
 
     test('should handle complex error hierarchy efficiently', async () => {
+      await createTestExecution('exec-perf-6');
       const context = new WorkflowContextImpl('exec-perf-6', 'test-workflow', {}, 1, {});
 
       const start = performance.now();
@@ -114,6 +142,7 @@ describe('WorkflowContext Performance', () => {
     });
 
     test('should handle catch handler efficiently', async () => {
+      await createTestExecution('exec-perf-7');
       const context = new WorkflowContextImpl('exec-perf-7', 'test-workflow', {}, 1, {});
 
       const start = performance.now();
@@ -131,6 +160,7 @@ describe('WorkflowContext Performance', () => {
 
   describe('circuit breaker performance', () => {
     test('should handle circuit breaker checks efficiently', async () => {
+      await createTestExecution('exec-perf-8');
       const context = new WorkflowContextImpl('exec-perf-8', 'test-workflow', {}, 1, {});
 
       const start = performance.now();
@@ -147,6 +177,7 @@ describe('WorkflowContext Performance', () => {
     });
 
     test('should handle circuit breaker state updates efficiently', async () => {
+      await createTestExecution('exec-perf-9');
       const context = new WorkflowContextImpl('exec-perf-9', 'test-workflow', {}, 1, {});
 
       // Execute multiple times to trigger circuit breaker logic
@@ -167,6 +198,7 @@ describe('WorkflowContext Performance', () => {
 
   describe('sleep performance', () => {
     test('should handle sleep efficiently', async () => {
+      await createTestExecution('exec-perf-10');
       const context = new WorkflowContextImpl('exec-perf-10', 'test-workflow', {}, 1, {});
 
       const start = performance.now();
@@ -179,6 +211,7 @@ describe('WorkflowContext Performance', () => {
     });
 
     test('should handle cached sleep efficiently', async () => {
+      await createTestExecution('exec-perf-11');
       const context = new WorkflowContextImpl('exec-perf-11', 'test-workflow', {}, 1, {});
 
       // First sleep
@@ -193,6 +226,7 @@ describe('WorkflowContext Performance', () => {
     });
 
     test('should handle multiple sleep operations efficiently', async () => {
+      await createTestExecution('exec-perf-12');
       const context = new WorkflowContextImpl('exec-perf-12', 'test-workflow', {}, 1, {});
 
       const start = performance.now();
@@ -211,6 +245,7 @@ describe('WorkflowContext Performance', () => {
 
   describe('memory usage', () => {
     test('should not leak memory with many step executions', async () => {
+      await createTestExecution('exec-memory-1');
       const context = new WorkflowContextImpl('exec-memory-1', 'test-workflow', {}, 1, {});
       const initialMemory = process.memoryUsage().heapUsed;
 
@@ -234,6 +269,7 @@ describe('WorkflowContext Performance', () => {
     });
 
     test('should handle error handlers without memory leaks', async () => {
+      await createTestExecution('exec-memory-2');
       const context = new WorkflowContextImpl('exec-memory-2', 'test-workflow', {}, 1, {});
       const initialMemory = process.memoryUsage().heapUsed;
 
@@ -263,6 +299,7 @@ describe('WorkflowContext Performance', () => {
 
   describe('database interaction performance', () => {
     test('should handle step persistence efficiently', async () => {
+      await createTestExecution('exec-db-perf-1');
       const context = new WorkflowContextImpl('exec-db-perf-1', 'test-workflow', {}, 1, {});
 
       const start = performance.now();
@@ -278,6 +315,9 @@ describe('WorkflowContext Performance', () => {
     });
 
     test('should handle concurrent step executions efficiently', async () => {
+      await createTestExecution('exec-db-perf-2');
+      await createTestExecution('exec-db-perf-3');
+      await createTestExecution('exec-db-perf-4');
       const context1 = new WorkflowContextImpl('exec-db-perf-2', 'test-workflow', {}, 1, {});
       const context2 = new WorkflowContextImpl('exec-db-perf-3', 'test-workflow', {}, 1, {});
       const context3 = new WorkflowContextImpl('exec-db-perf-4', 'test-workflow', {}, 1, {});
@@ -295,6 +335,7 @@ describe('WorkflowContext Performance', () => {
     });
 
     test('should handle step retry with database updates efficiently', async () => {
+      await createTestExecution('exec-db-perf-5');
       const context = new WorkflowContextImpl('exec-db-perf-5', 'test-workflow', {}, 1, {});
 
       let attempts = 0;
@@ -323,6 +364,7 @@ describe('WorkflowContext Performance', () => {
 
   describe('throughput tests', () => {
     test('should achieve minimum step execution throughput', async () => {
+      await createTestExecution('exec-throughput-1');
       const context = new WorkflowContextImpl('exec-throughput-1', 'test-workflow', {}, 1, {});
       const stepCount = 50;
 
@@ -345,6 +387,7 @@ describe('WorkflowContext Performance', () => {
     });
 
     test('should maintain performance with error handling throughput', async () => {
+      await createTestExecution('exec-throughput-2');
       const context = new WorkflowContextImpl('exec-throughput-2', 'test-workflow', {}, 1, {});
       const stepCount = 30;
 

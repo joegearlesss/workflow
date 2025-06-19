@@ -1,4 +1,5 @@
 import { DatabaseClient } from '../src/database';
+import { Workflow } from '../src/workflow';
 
 export namespace TestSetup {
   let testDbCounter = 0;
@@ -6,14 +7,11 @@ export namespace TestSetup {
   const dbLocks = new Map<string, Promise<void>>();
 
   export const createTestDatabase = async (): Promise<string> => {
-    // Use process ID and timestamp for better uniqueness across parallel processes
-    const uniqueId = `${process.pid}_${Date.now()}_${testDbCounter++}_${Math.random().toString(36).substr(2, 9)}`;
-    const dbPath = `:memory:${uniqueId}`;
-    activeDatabases.add(dbPath);
+    // Always use true in-memory database for tests
+    const dbPath = ':memory:';
     
     // Ensure database initialization is atomic
     const initPromise = initializeDatabase(dbPath);
-    dbLocks.set(dbPath, initPromise);
     
     await initPromise;
     
@@ -21,10 +19,8 @@ export namespace TestSetup {
   };
 
   const initializeDatabase = async (dbPath: string): Promise<void> => {
-    const db = DatabaseClient.initialize(dbPath);
-    
-    // Create the database schema manually since we don't have migrations
-    await createSchema();
+    // Use Workflow.initialize to properly set up database with migrations
+    await Workflow.initialize(dbPath);
     
     // Wait for initialization to complete
     await new Promise(resolve => setTimeout(resolve, 5));
@@ -143,6 +139,26 @@ export namespace TestSetup {
       DatabaseClient.close();
     } catch (error) {
       // Ignore close errors
+    }
+  };
+
+  /**
+   * Global cleanup function to remove any memory database files
+   */
+  export const globalCleanup = (): void => {
+    try {
+      // Clean up any remaining database connections
+      DatabaseClient.close();
+      
+      // Clear all tracking data structures
+      activeDatabases.clear();
+      dbLocks.clear();
+      
+      // Reset counter
+      testDbCounter = 0;
+    } catch (error) {
+      // Ignore cleanup errors
+      console.warn('Warning during global cleanup:', error);
     }
   };
 

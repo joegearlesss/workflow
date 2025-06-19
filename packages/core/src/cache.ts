@@ -201,7 +201,9 @@ namespace MemoCache {
       // Evict oldest entries if cache is full
       if (memoCache.size >= maxMemoSize) {
         const firstKey = memoCache.keys().next().value;
-        memoCache.delete(firstKey);
+        if (firstKey !== undefined) {
+          memoCache.delete(firstKey);
+        }
       }
       
       memoCache.set(key, result);

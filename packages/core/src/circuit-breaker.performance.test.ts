@@ -1,11 +1,13 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { CircuitBreaker, CircuitBreakerRegistry, CircuitBreakerUtils } from './circuit-breaker';
-import { DatabaseClient } from './database';
+import { DatabaseClient, Database } from './database';
+import { Workflow } from './workflow';
 
 describe('CircuitBreaker Performance', () => {
   beforeEach(async () => {
-    await DatabaseClient.initialize(':memory:');
+    await Workflow.initialize(':memory:');
     CircuitBreakerRegistry.clear();
+    await Database.CircuitBreaker.clearAll();
   });
 
   afterEach(() => {

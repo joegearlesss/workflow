@@ -291,6 +291,7 @@ describe('Database Operations', () => {
         executionId,
         stepName: 'updatable-step',
         status: 'running' as StepExecutionStatus,
+        input: {},
         attempt: 1,
         maxAttempts: 3,
         startedAt: new Date(),
@@ -313,6 +314,7 @@ describe('Database Operations', () => {
         executionId,
         stepName: 'step-1',
         status: 'completed' as StepExecutionStatus,
+        input: {},
         attempt: 1,
         maxAttempts: 3,
       });
@@ -321,6 +323,7 @@ describe('Database Operations', () => {
         executionId,
         stepName: 'step-2',
         status: 'running' as StepExecutionStatus,
+        input: {},
         attempt: 1,
         maxAttempts: 3,
       });
@@ -336,6 +339,7 @@ describe('Database Operations', () => {
         executionId,
         stepName: 'specific-step',
         status: 'completed' as StepExecutionStatus,
+        input: {},
         attempt: 1,
         maxAttempts: 3,
       });
@@ -355,6 +359,7 @@ describe('Database Operations', () => {
         executionId,
         stepName: 'retryable-step',
         status: 'failed' as StepExecutionStatus,
+        input: {},
         attempt: 2,
         maxAttempts: 3,
         error: { message: 'Step failed' },
@@ -364,6 +369,7 @@ describe('Database Operations', () => {
         executionId,
         stepName: 'max-attempts-step',
         status: 'failed' as StepExecutionStatus,
+        input: {},
         attempt: 3,
         maxAttempts: 3,
         error: { message: 'Max attempts reached' },

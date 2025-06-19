@@ -54,7 +54,12 @@ namespace Database {
       const now = new Date();
       
       const [created] = await db.insert(workflowDefinitions).values({
-        ...definition,
+        id: crypto.randomUUID(),
+        name: definition.name,
+        version: definition.version,
+        description: definition.description || null,
+        schema: definition.schema,
+        isActive: definition.isActive,
         createdAt: now,
         updatedAt: now,
       }).returning();
@@ -104,7 +109,14 @@ namespace Database {
     ): Promise<WorkflowDefinition | undefined> => {
       const db = DatabaseClient.getDatabase();
       const [updated] = await db.update(workflowDefinitions)
-        .set({ ...updates, updatedAt: new Date() })
+        .set({
+          ...(updates.name !== undefined && { name: updates.name }),
+          ...(updates.version !== undefined && { version: updates.version }),
+          ...(updates.description !== undefined && { description: updates.description }),
+          ...(updates.schema !== undefined && { schema: updates.schema }),
+          ...(updates.isActive !== undefined && { isActive: updates.isActive }),
+          updatedAt: new Date()
+        })
         .where(eq(workflowDefinitions.id, id))
         .returning();
       
@@ -142,7 +154,16 @@ namespace Database {
       const now = new Date();
       
       const [created] = await db.insert(workflowExecutions).values({
-        ...execution,
+        id: execution.id,
+        definitionId: execution.definitionId,
+        workflowName: execution.workflowName,
+        status: execution.status,
+        input: execution.input,
+        output: execution.output || null,
+        error: execution.error || null,
+        metadata: execution.metadata || null,
+        startedAt: execution.startedAt || null,
+        completedAt: execution.completedAt || null,
         createdAt: now,
         updatedAt: now,
       }).returning();
@@ -237,7 +258,17 @@ namespace Database {
       const now = new Date();
       
       const [created] = await db.insert(stepExecutions).values({
-        ...stepExecution,
+        id: crypto.randomUUID(),
+        executionId: stepExecution.executionId,
+        stepName: stepExecution.stepName,
+        status: stepExecution.status,
+        input: stepExecution.input,
+        output: stepExecution.output || null,
+        error: stepExecution.error || null,
+        attempt: stepExecution.attempt,
+        maxAttempts: stepExecution.maxAttempts,
+        startedAt: stepExecution.startedAt || null,
+        completedAt: stepExecution.completedAt || null,
         createdAt: now,
         updatedAt: now,
       }).returning();
@@ -327,6 +358,22 @@ namespace Database {
    */
   export namespace CircuitBreaker {
     /**
+     * Get circuit breaker state by name
+     * @param name - Circuit breaker name
+     * @returns Circuit breaker state or undefined if not found
+     */
+    export const get = async (name: string): Promise<CircuitBreakerState | undefined> => {
+      const db = DatabaseClient.getDatabase();
+      
+      const existing = await db.select()
+        .from(circuitBreakerStates)
+        .where(eq(circuitBreakerStates.name, name))
+        .limit(1);
+      
+      return existing[0] ? CircuitBreakerStateSchema.parse(nullToUndefined(existing[0])) : undefined;
+    };
+
+    /**
      * Get or create circuit breaker state
      * @param name - Circuit breaker name
      * @returns Circuit breaker state
@@ -344,17 +391,34 @@ namespace Database {
         return CircuitBreakerStateSchema.parse(nullToUndefined(existing[0]));
       }
       
-      // Create new state
-      const now = new Date();
-      const [created] = await db.insert(circuitBreakerStates).values({
-        name,
-        state: 'closed',
-        failureCount: 0,
-        createdAt: now,
-        updatedAt: now,
-      }).returning();
-      
-      return CircuitBreakerStateSchema.parse(nullToUndefined(created));
+      // Create new state - handle race condition with UNIQUE constraint
+      try {
+        const now = new Date();
+        const [created] = await db.insert(circuitBreakerStates).values({
+          name,
+          state: 'closed',
+          failureCount: 0,
+          createdAt: now,
+          updatedAt: now,
+        }).returning();
+        
+        return CircuitBreakerStateSchema.parse(nullToUndefined(created));
+      } catch (error: any) {
+        // If UNIQUE constraint failed, another operation created it - query again
+        if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+          const existing = await db.select()
+            .from(circuitBreakerStates)
+            .where(eq(circuitBreakerStates.name, name))
+            .limit(1);
+          
+          if (existing[0]) {
+            return CircuitBreakerStateSchema.parse(nullToUndefined(existing[0]));
+          }
+        }
+        
+        // Re-throw any other errors
+        throw error;
+      }
     };
 
     /**
@@ -396,6 +460,16 @@ namespace Database {
       
       return updated ? CircuitBreakerStateSchema.parse(nullToUndefined(updated)) : undefined;
     };
+
+    /**
+     * Clear all circuit breaker states (for testing)
+     * @returns Number of states cleared
+     */
+    export const clearAll = async (): Promise<number> => {
+      const db = DatabaseClient.getDatabase();
+      const result = await db.delete(circuitBreakerStates);
+      return (result as any).changes || 0;
+    };
   }
 
   /**
@@ -426,7 +500,7 @@ namespace Database {
           expiresAt,
         });
         return true;
-      } catch {
+      } catch (error) {
         // Lock already exists or constraint violation
         return false;
       }
@@ -442,7 +516,7 @@ namespace Database {
       const result = await db.delete(workflowLocks)
         .where(eq(workflowLocks.executionId, executionId));
       
-      return result.changes > 0;
+      return (result as any).changes > 0;
     };
 
     /**
@@ -455,7 +529,7 @@ namespace Database {
       const result = await db.delete(workflowLocks)
         .where(eq(workflowLocks.expiresAt, now));
       
-      return result.changes;
+      return (result as any).changes;
     };
   }
 }

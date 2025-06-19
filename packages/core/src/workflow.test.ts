@@ -6,13 +6,34 @@ import type { WorkflowHandler, WorkflowContext } from './types';
 describe('Workflow', () => {
   beforeEach(async () => {
     // Initialize in-memory database for testing
-    await DatabaseClient.initialize(':memory:');
+    await Workflow.initialize(':memory:');
   });
 
   afterEach(() => {
     // Clean up database connection
     DatabaseClient.close();
   });
+
+  // Helper function to create workflow execution for testing
+  const createTestExecution = async (executionId: string, workflowName: string = 'test-workflow') => {
+    // Create a workflow definition first
+    const definition = await Database.WorkflowDefinition.create({
+      name: `${workflowName}-${executionId}`,
+      version: '1.0.0',
+      description: 'Test workflow definition',
+      schema: { steps: [] },
+      isActive: true
+    });
+
+    // Create the workflow execution
+    return Database.WorkflowExecution.create({
+      id: executionId,
+      definitionId: definition.id,
+      workflowName: workflowName,
+      status: 'running',
+      input: {}
+    });
+  };
 
   describe('define', () => {
     test('should define a new workflow successfully', () => {
@@ -92,12 +113,7 @@ describe('Workflow', () => {
 
     test('should throw error for already running execution', async () => {
       // Create a workflow execution that's marked as running
-      await Database.WorkflowExecution.create({
-        id: 'running-exec',
-        definitionId: 'test-def-id',
-        workflowName: 'test-workflow',
-        status: 'running',
-      });
+      await createTestExecution('running-exec', 'test-workflow');
 
       const handler: WorkflowHandler = async (ctx) => {
         return { result: 'success' };
@@ -209,12 +225,7 @@ describe('Workflow', () => {
   describe('cancel', () => {
     test('should cancel a running workflow execution', async () => {
       // Create a running execution
-      await Database.WorkflowExecution.create({
-        id: 'cancel-exec',
-        definitionId: 'test-def',
-        workflowName: 'test-workflow',
-        status: 'running',
-      });
+      await createTestExecution('cancel-exec', 'test-workflow');
 
       const result = await Workflow.cancel('cancel-exec');
       expect(result).toBe(true);
@@ -230,12 +241,9 @@ describe('Workflow', () => {
     });
 
     test('should return false for already completed execution', async () => {
-      await Database.WorkflowExecution.create({
-        id: 'completed-exec',
-        definitionId: 'test-def',
-        workflowName: 'test-workflow',
-        status: 'completed',
-      });
+      const execution = await createTestExecution('completed-exec', 'test-workflow');
+      // Update to completed status
+      await Database.WorkflowExecution.update('completed-exec', { status: 'completed' });
 
       const result = await Workflow.cancel('completed-exec');
       expect(result).toBe(false);
@@ -244,10 +252,9 @@ describe('Workflow', () => {
 
   describe('getExecution', () => {
     test('should return workflow execution details', async () => {
-      const testExecution = await Database.WorkflowExecution.create({
-        id: 'get-exec-test',
-        definitionId: 'test-def',
-        workflowName: 'test-workflow',
+      const testExecution = await createTestExecution('get-exec-test', 'test-workflow');
+      // Update with test data
+      await Database.WorkflowExecution.update('get-exec-test', {
         status: 'completed',
         input: { test: 'input' },
         output: { test: 'output' },
@@ -269,19 +276,11 @@ describe('Workflow', () => {
 
   describe('listExecutions', () => {
     test('should list executions by workflow name', async () => {
-      await Database.WorkflowExecution.create({
-        id: 'list-exec-1',
-        definitionId: 'test-def',
-        workflowName: 'list-test-workflow',
-        status: 'completed',
-      });
+      await createTestExecution('list-exec-1', 'list-test-workflow');
+      await Database.WorkflowExecution.update('list-exec-1', { status: 'completed' });
 
-      await Database.WorkflowExecution.create({
-        id: 'list-exec-2',
-        definitionId: 'test-def',
-        workflowName: 'list-test-workflow',
-        status: 'failed',
-      });
+      await createTestExecution('list-exec-2', 'list-test-workflow');
+      await Database.WorkflowExecution.update('list-exec-2', { status: 'failed' });
 
       const executions = await Workflow.listExecutions('list-test-workflow');
       expect(executions).toHaveLength(2);
@@ -290,19 +289,11 @@ describe('Workflow', () => {
     });
 
     test('should filter executions by status', async () => {
-      await Database.WorkflowExecution.create({
-        id: 'filter-exec-1',
-        definitionId: 'test-def',
-        workflowName: 'filter-test-workflow',
-        status: 'completed',
-      });
+      await createTestExecution('filter-exec-1', 'filter-test-workflow');
+      await Database.WorkflowExecution.update('filter-exec-1', { status: 'completed' });
 
-      await Database.WorkflowExecution.create({
-        id: 'filter-exec-2',
-        definitionId: 'test-def',
-        workflowName: 'filter-test-workflow',
-        status: 'failed',
-      });
+      await createTestExecution('filter-exec-2', 'filter-test-workflow');
+      await Database.WorkflowExecution.update('filter-exec-2', { status: 'failed' });
 
       const completedExecutions = await Workflow.listExecutions('filter-test-workflow', 'completed');
       expect(completedExecutions).toHaveLength(1);
@@ -352,12 +343,7 @@ describe('Workflow', () => {
       Workflow.define('interrupted-test', handler);
 
       // Create an interrupted execution
-      await Database.WorkflowExecution.create({
-        id: 'interrupted-exec',
-        definitionId: 'test-def',
-        workflowName: 'interrupted-test',
-        status: 'running',
-      });
+      await createTestExecution('interrupted-exec', 'interrupted-test');
 
       const resumedCount = await Workflow.resumeInterrupted();
       expect(resumedCount).toBe(1);
@@ -374,12 +360,7 @@ describe('Workflow', () => {
 
       Workflow.define('failed-resume-test', handler);
 
-      await Database.WorkflowExecution.create({
-        id: 'failed-resume-exec',
-        definitionId: 'test-def',
-        workflowName: 'failed-resume-test',
-        status: 'running',
-      });
+      await createTestExecution('failed-resume-exec', 'failed-resume-test');
 
       const resumedCount = await Workflow.resumeInterrupted();
       expect(resumedCount).toBe(0);
@@ -394,7 +375,10 @@ describe('Workflow', () => {
       // Close existing connection
       DatabaseClient.close();
 
-      await expect(Workflow.initialize(':memory:')).resolves.not.toThrow();
+      // Should not throw when initializing
+      await expect(async () => {
+        await Workflow.initialize(':memory:');
+      }).not.toThrow();
 
       // Verify database is working
       expect(DatabaseClient.healthCheck()).toBe(true);

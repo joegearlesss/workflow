@@ -2,15 +2,37 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { WorkflowContext, WorkflowContextImpl } from './context';
 import { DatabaseClient, Database } from './database';
 import { ErrorHandling } from './error-handling';
+import { Workflow } from './workflow';
 
 describe('WorkflowContext', () => {
   beforeEach(async () => {
-    await DatabaseClient.initialize(':memory:');
+    await Workflow.initialize(':memory:');
   });
 
   afterEach(() => {
     DatabaseClient.close();
   });
+
+  // Helper function to create workflow execution for testing
+  const createTestExecution = async (executionId: string) => {
+    // Create a workflow definition first
+    const definition = await Database.WorkflowDefinition.create({
+      name: `test-workflow-${executionId}`,
+      version: '1.0.0',
+      description: 'Test workflow definition',
+      schema: { steps: [] },
+      isActive: true
+    });
+
+    // Create the workflow execution
+    return Database.WorkflowExecution.create({
+      id: executionId,
+      definitionId: definition.id,
+      workflowName: 'test-workflow',
+      status: 'running',
+      input: {}
+    });
+  };
 
   describe('create', () => {
     test('should create workflow context with correct properties', () => {
@@ -32,6 +54,7 @@ describe('WorkflowContext', () => {
 
   describe('step', () => {
     test('should execute step successfully and persist result', async () => {
+      await createTestExecution('exec-step-1');
       const context = new WorkflowContextImpl('exec-step-1', 'test-workflow', {}, 1, {});
 
       const result = await context.step('test-step', async () => {
@@ -51,6 +74,7 @@ describe('WorkflowContext', () => {
     });
 
     test('should return cached result for completed step', async () => {
+      await createTestExecution('exec-step-2');
       const context = new WorkflowContextImpl('exec-step-2', 'test-workflow', {}, 1, {});
 
       // First execution
@@ -68,6 +92,7 @@ describe('WorkflowContext', () => {
     });
 
     test('should handle step failure and retry', async () => {
+      await createTestExecution('exec-step-3');
       const context = new WorkflowContextImpl('exec-step-3', 'test-workflow', {}, 1, {});
       let attempts = 0;
 
@@ -83,16 +108,17 @@ describe('WorkflowContext', () => {
 
       expect(attempts).toBe(1);
 
-      // Verify step execution was persisted as failed
+      // Verify step execution was persisted as retrying after first failure
       const stepExecution = await Database.StepExecution.findByExecutionAndStep(
         'exec-step-3',
         'failing-step'
       );
-      expect(stepExecution?.status).toBe('failed');
+      expect(stepExecution?.status).toBe('retrying');
       expect(stepExecution?.attempt).toBe(1);
     });
 
     test('should handle error with error handlers', async () => {
+      await createTestExecution('exec-step-4');
       const context = new WorkflowContextImpl('exec-step-4', 'test-workflow', {}, 1, {});
 
       const result = await context.step('error-handled-step', async () => {
@@ -114,6 +140,7 @@ describe('WorkflowContext', () => {
     });
 
     test('should use default error handler when specific handler not found', async () => {
+      await createTestExecution('exec-step-5');
       const context = new WorkflowContextImpl('exec-step-5', 'test-workflow', {}, 1, {});
 
       const result = await context.step('default-error-step', async () => {
@@ -131,6 +158,7 @@ describe('WorkflowContext', () => {
     });
 
     test('should use catch handler as fallback', async () => {
+      await createTestExecution('exec-step-6');
       const context = new WorkflowContextImpl('exec-step-6', 'test-workflow', {}, 1, {});
 
       const result = await context.step('catch-step', async () => {
@@ -143,6 +171,7 @@ describe('WorkflowContext', () => {
     });
 
     test('should handle circuit breaker configuration', async () => {
+      await createTestExecution('exec-step-7');
       const context = new WorkflowContextImpl('exec-step-7', 'test-workflow', {}, 1, {});
 
       // This should work normally since circuit breaker starts closed
@@ -157,6 +186,7 @@ describe('WorkflowContext', () => {
     });
 
     test('should handle step retry attempts', async () => {
+      await createTestExecution('exec-step-8');
       const context = new WorkflowContextImpl('exec-step-8', 'test-workflow', {}, 1, {});
 
       // Create initial failed step
@@ -166,6 +196,7 @@ describe('WorkflowContext', () => {
         status: 'failed',
         attempt: 1,
         maxAttempts: 3,
+        input: {},
       });
 
       // Retry should increment attempt
@@ -186,6 +217,7 @@ describe('WorkflowContext', () => {
 
   describe('sleep', () => {
     test('should sleep for specified duration', async () => {
+      await createTestExecution('exec-sleep-1');
       const context = new WorkflowContextImpl('exec-sleep-1', 'test-workflow', {}, 1, {});
       const startTime = Date.now();
 
@@ -210,6 +242,7 @@ describe('WorkflowContext', () => {
     });
 
     test('should skip sleep if already completed', async () => {
+      await createTestExecution('exec-sleep-2');
       const context = new WorkflowContextImpl('exec-sleep-2', 'test-workflow', {}, 1, {});
 
       // First sleep
@@ -227,6 +260,7 @@ describe('WorkflowContext', () => {
 
   describe('error matching', () => {
     test('should match error by name', async () => {
+      await createTestExecution('exec-match-1');
       const context = new WorkflowContextImpl('exec-match-1', 'test-workflow', {}, 1, {});
 
       const customError = new Error('Custom error');
@@ -244,6 +278,7 @@ describe('WorkflowContext', () => {
     });
 
     test('should match error by constructor name', async () => {
+      await createTestExecution('exec-match-2');
       const context = new WorkflowContextImpl('exec-match-2', 'test-workflow', {}, 1, {});
 
       const result = await context.step('match-by-constructor', async () => {

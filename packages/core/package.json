@@ -21,6 +21,8 @@
     "test:performance": "bun test \"**/*.performance.test.ts\"",
     "test:integration": "bun test \"tests/integration/*.test.ts\"",
     "test:e2e": "bun test \"tests/e2e/*.test.ts\"",
+    "test:clean": "bun test && node cleanup-test-files.js",
+    "cleanup": "node cleanup-test-files.js",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio"

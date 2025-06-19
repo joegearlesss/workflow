@@ -31,17 +31,28 @@ namespace DatabaseClient {
       return db;
     }
 
-    sqlite = new Database(dbPath, { create: true });
+    // For true in-memory databases, use special handling
+    const isInMemory = dbPath === ':memory:';
+    sqlite = new Database(isInMemory ? ':memory:' : dbPath, { create: true });
     
-    // Enable WAL mode for better concurrency and performance
-    sqlite.exec('PRAGMA journal_mode = WAL');
-    sqlite.exec('PRAGMA synchronous = NORMAL');
-    sqlite.exec('PRAGMA cache_size = -64000'); // 64MB cache
+    // Configure SQLite pragmas - different settings for in-memory vs disk
     sqlite.exec('PRAGMA foreign_keys = ON');
     sqlite.exec('PRAGMA temp_store = MEMORY');
-    sqlite.exec('PRAGMA mmap_size = 268435456'); // 256MB memory map
-    sqlite.exec('PRAGMA page_size = 4096'); // Larger page size for better performance
-    sqlite.exec('PRAGMA busy_timeout = 30000'); // 30 second busy timeout
+    
+    if (isInMemory) {
+      // In-memory database settings
+      sqlite.exec('PRAGMA journal_mode = MEMORY');
+      sqlite.exec('PRAGMA synchronous = FULL');
+      sqlite.exec('PRAGMA cache_size = -8000'); // 8MB cache for tests
+    } else {
+      // Disk database settings for production
+      sqlite.exec('PRAGMA journal_mode = WAL');
+      sqlite.exec('PRAGMA synchronous = NORMAL');
+      sqlite.exec('PRAGMA cache_size = -64000'); // 64MB cache
+      sqlite.exec('PRAGMA mmap_size = 268435456'); // 256MB memory map
+      sqlite.exec('PRAGMA page_size = 4096'); // Larger page size for better performance
+      sqlite.exec('PRAGMA busy_timeout = 30000'); // 30 second busy timeout
+    }
 
     db = drizzle(sqlite, { schema });
     return db;
@@ -60,12 +71,92 @@ namespace DatabaseClient {
   };
 
   /**
-   * Run database migrations
-   * @param migrationsFolder - Path to migrations folder
+   * Run database migrations and create tables
+   * @param migrationsFolder - Path to migrations folder (unused)
    */
   export const runMigrations = async (migrationsFolder = './src/database/migrations'): Promise<void> => {
-    const database = getDatabase();
-    await migrate(database, { migrationsFolder });
+    if (!sqlite) {
+      throw new Error('Database not initialized');
+    }
+
+    // Create tables from schema manually
+    const createTables = `
+      CREATE TABLE IF NOT EXISTS workflow_definitions (
+        id TEXT PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        version TEXT NOT NULL DEFAULT '1.0.0',
+        description TEXT,
+        schema TEXT NOT NULL,
+        is_active INTEGER DEFAULT 1 NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS workflow_executions (
+        id TEXT PRIMARY KEY NOT NULL,
+        definition_id TEXT NOT NULL,
+        workflow_name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        input TEXT,
+        output TEXT,
+        error TEXT,
+        metadata TEXT,
+        started_at INTEGER,
+        completed_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (definition_id) REFERENCES workflow_definitions(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS step_executions (
+        id TEXT PRIMARY KEY NOT NULL,
+        execution_id TEXT NOT NULL,
+        step_name TEXT NOT NULL,
+        status TEXT NOT NULL,
+        input TEXT,
+        output TEXT,
+        error TEXT,
+        attempt INTEGER NOT NULL,
+        max_attempts INTEGER NOT NULL,
+        started_at INTEGER,
+        completed_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (execution_id) REFERENCES workflow_executions(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS circuit_breaker_states (
+        id TEXT PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL,
+        failure_count INTEGER NOT NULL DEFAULT 0,
+        last_failure_at INTEGER,
+        next_attempt_at INTEGER,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS workflow_locks (
+        id TEXT PRIMARY KEY NOT NULL,
+        execution_id TEXT NOT NULL UNIQUE,
+        lock_key TEXT NOT NULL,
+        acquired_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        metadata TEXT,
+        FOREIGN KEY (execution_id) REFERENCES workflow_executions(id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_workflow_executions_name ON workflow_executions(workflow_name);
+      CREATE INDEX IF NOT EXISTS idx_workflow_executions_status ON workflow_executions(status);
+      CREATE INDEX IF NOT EXISTS idx_step_executions_execution_id ON step_executions(execution_id);
+      CREATE INDEX IF NOT EXISTS idx_step_executions_status ON step_executions(status);
+      CREATE INDEX IF NOT EXISTS idx_circuit_breaker_name ON circuit_breaker_states(name);
+      CREATE INDEX IF NOT EXISTS idx_workflow_locks_expires ON workflow_locks(expires_at);
+    `;
+
+    // Execute table creation
+    sqlite.exec(createTables);
+    console.debug('Database tables created successfully');
   };
 
   /**
@@ -139,7 +230,7 @@ namespace DatabaseClient {
    * @returns Transaction result
    */
   export const transaction = async <T>(
-    fn: (tx: ReturnType<typeof drizzle>) => Promise<T>
+    fn: (tx: any) => Promise<T>
   ): Promise<T> => {
     const database = getDatabase();
     return database.transaction(fn);

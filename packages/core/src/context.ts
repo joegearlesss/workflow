@@ -95,6 +95,19 @@ class StepBuilderImpl<TInput = unknown, TOutput = unknown> implements StepBuilde
   ) {}
 
   /**
+   * Get workflow input data for error handler context
+   */
+  private async getWorkflowInput(): Promise<any> {
+    try {
+      const execution = await Database.WorkflowExecution.findById(this.executionId);
+      return execution?.input || {};
+    } catch (error) {
+      console.error('Failed to get workflow input:', error);
+      return {};
+    }
+  }
+
+  /**
    * Configure error handlers for specific error types
    * @param handlers - Map of error type names to handler functions
    * @returns This builder for chaining
@@ -127,6 +140,16 @@ class StepBuilderImpl<TInput = unknown, TOutput = unknown> implements StepBuilde
   }
 
   /**
+   * PromiseLike implementation to allow direct awaiting
+   */
+  then<TResult1 = TOutput, TResult2 = never>(
+    onfulfilled?: ((value: TOutput) => TResult1 | PromiseLike<TResult1>) | undefined | null,
+    onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | undefined | null
+  ): PromiseLike<TResult1 | TResult2> {
+    return this.execute().then(onfulfilled, onrejected);
+  }
+
+  /**
    * Execute the step with all configured options
    * @returns Promise that resolves with step output
    */
@@ -150,10 +173,11 @@ class StepBuilderImpl<TInput = unknown, TOutput = unknown> implements StepBuilde
     if (this.circuitBreakerConfig) {
       const canExecute = await this.checkCircuitBreaker();
       if (!canExecute && this.circuitBreakerConfig.onOpen) {
+        const workflowInput = await this.getWorkflowInput();
         const context = new WorkflowContextImpl(
           this.executionId,
           '', // workflow name not needed for onOpen
-          undefined as TInput,
+          workflowInput,
           this.workflowAttempt,
           {}
         );
@@ -170,13 +194,14 @@ class StepBuilderImpl<TInput = unknown, TOutput = unknown> implements StepBuilde
         status: 'running',
         attempt,
         startedAt: new Date(),
-      }))!;
+      })) as StepExecution;
     } else {
       // Create new step execution
       stepExecution = await Database.StepExecution.create({
         executionId: this.executionId,
         stepName: this.stepName,
         status: 'running',
+        input: {},
         attempt,
         maxAttempts,
         startedAt: new Date(),
@@ -217,7 +242,7 @@ class StepBuilderImpl<TInput = unknown, TOutput = unknown> implements StepBuilde
           output: handlerResult.result as Record<string, unknown>,
           completedAt: new Date(),
         });
-        return handlerResult.result;
+        return handlerResult.result as TOutput;
       }
 
       // Check if we can retry
@@ -263,10 +288,11 @@ class StepBuilderImpl<TInput = unknown, TOutput = unknown> implements StepBuilde
 
       if (this.matchesErrorType(error, errorType)) {
         try {
+          const workflowInput = await this.getWorkflowInput();
           const context = new WorkflowContextImpl(
             this.executionId,
             '',
-            undefined as TInput,
+            workflowInput,
             this.workflowAttempt,
             {}
           );
@@ -282,10 +308,11 @@ class StepBuilderImpl<TInput = unknown, TOutput = unknown> implements StepBuilde
     // Try default error handler
     if (this.errorHandlers.default) {
       try {
+        const workflowInput = await this.getWorkflowInput();
         const context = new WorkflowContextImpl(
           this.executionId,
           '',
-          undefined as TInput,
+          workflowInput,
           this.workflowAttempt,
           {}
         );
@@ -299,10 +326,11 @@ class StepBuilderImpl<TInput = unknown, TOutput = unknown> implements StepBuilde
     // Try catch handler
     if (this.catchHandler) {
       try {
+        const workflowInput = await this.getWorkflowInput();
         const context = new WorkflowContextImpl(
           this.executionId,
           '',
-          undefined as TInput,
+          workflowInput,
           this.workflowAttempt,
           {}
         );

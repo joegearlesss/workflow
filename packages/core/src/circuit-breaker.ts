@@ -28,9 +28,9 @@ namespace CircuitBreaker {
     readonly state: State;
     readonly failureCount: number;
     readonly successCount: number;
-    readonly lastFailureAt?: Date;
-    readonly lastSuccessAt?: Date;
-    readonly nextAttemptAt?: Date;
+    readonly lastFailureAt?: Date | undefined;
+    readonly lastSuccessAt?: Date | undefined;
+    readonly nextAttemptAt?: Date | undefined;
     readonly totalRequests: number;
     readonly totalFailures: number;
     readonly totalSuccesses: number;
@@ -49,7 +49,11 @@ namespace CircuitBreaker {
    */
   export const getStatistics = async (name: string): Promise<Statistics | undefined> => {
     try {
-      const state = await Database.CircuitBreaker.getOrCreate(name);
+      const state = await Database.CircuitBreaker.get(name);
+      
+      if (!state) {
+        return undefined;
+      }
       
       return {
         state: state.state,

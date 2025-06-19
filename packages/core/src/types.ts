@@ -26,8 +26,8 @@ export type ErrorHandler<TInput = unknown, TOutput = unknown> = (
 ) => Promise<TOutput>;
 
 export type ErrorHandlerMap<TInput = unknown, TOutput = unknown> = {
-  readonly [K: string]: ErrorHandler<TInput, TOutput>;
-  readonly default?: ErrorHandler<TInput, TOutput>;
+  [K: string]: ErrorHandler<TInput, TOutput>;
+  default?: ErrorHandler<TInput, TOutput>;
 };
 
 export interface CircuitBreakerConfig {
@@ -40,7 +40,7 @@ export interface WorkflowDefinition {
   readonly id: string;
   readonly name: string;
   readonly version: string;
-  readonly description?: string;
+  readonly description?: string | undefined;
   readonly schema: Record<string, unknown>;
   readonly isActive: boolean;
   readonly createdAt: Date;
@@ -52,12 +52,12 @@ export interface WorkflowExecution {
   readonly definitionId: string;
   readonly workflowName: string;
   readonly status: 'pending' | 'running' | 'completed' | 'failed' | 'paused' | 'cancelled';
-  readonly input?: Record<string, unknown>;
-  readonly output?: Record<string, unknown>;
-  readonly error?: Record<string, unknown>;
-  readonly metadata?: Record<string, unknown>;
-  readonly startedAt?: Date;
-  readonly completedAt?: Date;
+  readonly input: Record<string, unknown>;
+  readonly output?: Record<string, unknown> | undefined;
+  readonly error?: Record<string, unknown> | undefined;
+  readonly metadata?: Record<string, unknown> | undefined;
+  readonly startedAt?: Date | undefined;
+  readonly completedAt?: Date | undefined;
   readonly createdAt: Date;
   readonly updatedAt: Date;
 }
@@ -67,13 +67,13 @@ export interface StepExecution {
   readonly executionId: string;
   readonly stepName: string;
   readonly status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped' | 'retrying';
-  readonly input?: Record<string, unknown>;
-  readonly output?: Record<string, unknown>;
-  readonly error?: Record<string, unknown>;
+  readonly input: Record<string, unknown>;
+  readonly output?: Record<string, unknown> | undefined;
+  readonly error?: Record<string, unknown> | undefined;
   readonly attempt: number;
   readonly maxAttempts: number;
-  readonly startedAt?: Date;
-  readonly completedAt?: Date;
+  readonly startedAt?: Date | undefined;
+  readonly completedAt?: Date | undefined;
   readonly createdAt: Date;
   readonly updatedAt: Date;
 }
@@ -93,7 +93,7 @@ export interface WorkflowContext<TInput = unknown> {
   sleep(name: string, durationMs: number): Promise<void>;
 }
 
-export interface StepBuilder<TInput = unknown, TOutput = unknown> {
+export interface StepBuilder<TInput = unknown, TOutput = unknown> extends PromiseLike<TOutput> {
   onError(handlers: ErrorHandlerMap<TInput, TOutput>): StepBuilder<TInput, TOutput>;
   withCircuitBreaker(config: CircuitBreakerConfig): StepBuilder<TInput, TOutput>;
   catch<TFallback = TOutput>(
